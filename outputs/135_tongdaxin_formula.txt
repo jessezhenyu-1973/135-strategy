@@ -1,0 +1,249 @@
+; 135 均线交易系统 — 通达信选股公式
+; 版本: v1.0
+; 日期: 2026-08-13
+; 说明: 适用于通达信/同花顺等国内主流行情软件
+; 使用: 公式管理器 → 技术指标 → 条件选股 → 导入本公式
+
+; ============================================================
+; 第一部分: 核心均线参数定义
+; ============================================================
+
+M13:MA(CLOSE,13);
+M34:MA(CLOSE,34);
+M55:MA(CLOSE,55);
+VOL_MA5:MA(VOLUME,5);
+
+; DMI 指标
+TR:=MAX(MAX(HIGH-LOW,ABS(HIGH-REF(CLOSE,1))),ABS(LOW-REF(CLOSE,1)));
+HD:=HIGH-REF(HIGH,1);
+LD:=REF(LOW,1)-LOW;
+DMP:=IF((HD>0)AND(HD>LD),HD,0);
+DMM:=IF((LD>0)AND(LD>HD),LD,0);
+PDI14:100*EMA(DMP,14)/EMA(TR,14);
+MDI14:100*EMA(DMM,14)/EMA(TR,14);
+ADX14:MA(MDI14,14);
+ADXR14:(ADX14+REF(ADX14,14))/2;
+
+; MACD 指标
+DIF:EMA(CLOSE,12)-EMA(CLOSE,26);
+DEA:EMA(DIF,9);
+MACD1:(DIF-DEA)*2,COLORSTICK;
+
+; ============================================================
+; 信号 #1: 红杏出墙 (核心买点)
+; 定义: 13日均线走平转升 + 阳线上站 + 放量
+; ============================================================
+
+RED_APRICOT:=(M13>=REF(M13,1)) AND (M13>REF(M13,2)) 
+             AND (CLOSE>M13) AND (CLOSE>OPEN) 
+             AND (VOLUME>1.2*VOL_MA5)
+             AND (M55>REF(M55,1));
+
+; ============================================================
+; 信号 #3: 金屋藏娇
+; 定义: 长阴下影线后次日缩量小阴
+; ============================================================
+
+GOLDEN_CAGE:=(CLOSE<OPEN) AND (REF(CLOSE,1)<REF(OPEN,1))
+             AND ((MIN(OPEN,CLOSE)-LOW)/MAX(0.001,REF(OPEN,1)-REF(CLOSE,1))>1.5)
+             AND (CLOSE<OPEN) AND (CLOSE>REF(LOW,1))
+             AND (VOLUME<0.7*REF(VOLUME,1))
+             AND (LOW>REF(LOW,1));
+
+; ============================================================
+; 信号 #4: 日月合璧
+; 定义: 跳空低开阴线后次日阳线覆盖
+; ============================================================
+
+SUN_MOON:=((REF(VOLUME,2)<0.5*MA(VOLUME,5)) AND
+            (OPEN<REF(CLOSE,2)*0.98) AND
+            (CLOSE<OPEN) AND
+            (CLOSE>=REF(OPEN,1)));
+
+; ============================================================
+; 信号 #11: 黑客点击 (核心买点)
+; 定义: 突破55后回踩13/55结点
+; ============================================================
+
+HACKER_CLICK:=ABS(M13-M55)/M55<0.02
+              AND ABS(LOW-M55)/M55<0.03
+              AND (CLOSE>=LOW);
+
+; ============================================================
+; 信号 #12: 红衣侠女 (核心买点)
+; 定义: 13日金叉55日，放量突破
+; ============================================================
+
+RED_GIRL:=(M13<REF(M55,1)) AND (M13>M55)
+          AND (CLOSE>OPEN) AND (CLOSE>M55)
+          AND (VOLUME>1.5*VOL_MA5);
+
+; ============================================================
+; 信号 #13: 海底捞月
+; 定义: 13日下穿55日后再上穿
+; ============================================================
+
+SEA_FISHING:=M13<REF(M55,1) AND M13>M55;
+
+; ============================================================
+; 信号 #16: 一阳穿三线
+; 定义: 三线间距小，放量穿越
+; ============================================================
+
+ONE_CANDLE_THREE:=MAX(M13,MAX(M34,M55))-MIN(M13,MIN(M34,M55))
+                  /MAX(0.001,MIN(M13,MIN(M34,M55)))<0.03
+                  AND (CLOSE>M13) AND (CLOSE>M34) AND (CLOSE>M55)
+                  AND (OPEN<M13) AND (VOLUME>2*VOL_MA5)
+                  AND (CLOSE>OPEN);
+
+; ============================================================
+; 信号 #17: 揭竿而起
+; 定义: 均线黏合后放量突破
+; ============================================================
+
+REBEL_RISE:=MAX(M13,MAX(M34,M55))-MIN(M13,MIN(M34,M55))
+            /MAX(0.001,MIN(M13,MIN(M34,M55)))<0.03
+            AND (CLOSE>M13) AND (CLOSE>M34) AND (CLOSE>M55)
+            AND (VOLUME>2.5*VOL_MA5) AND (CLOSE>OPEN)
+            AND ((CLOSE-OPEN)/OPEN>0.03);
+
+; ============================================================
+; 信号 #21: 梅开二度
+; 定义: 13日二次上穿34日
+; ============================================================
+
+FLOWERS_BLOOM:=M13<REF(M34,1) AND M13>M34
+               AND M34>M55;
+
+; ============================================================
+; 信号 #22: 浪子回头
+; 定义: 55日支撑后回升
+; ============================================================
+
+BOY_RETURN:=(M55>REF(M55,1)) AND (REF(M55,1)>REF(M55,2))
+            AND ABS(LOW-M55)/M55<0.02
+            AND (CLOSE>M55) AND (CLOSE>REF(CLOSE,1))
+            AND (VOLUME>VOL_MA5);
+
+; ============================================================
+; 信号 #23: 三军集结
+; 定义: 三线交汇
+; ============================================================
+
+THREE_ARMY:=(ABS(M13-M55)/M55<0.02)
+            AND (ABS(M34-M55)/M55<0.02)
+            AND (VOLUME>1.2*VOL_MA5);
+
+; ============================================================
+; 信号 #27: 双蹄并进 (DMI共振)
+; ============================================================
+
+DMI_SURE:=(PDI14>MDI14) AND (REF(PDI14,1)<=REF(MDI14,1))
+          AND (ADX14>20) AND (M13>M55);
+
+; ============================================================
+; 信号 #34: 串阳
+; 定义: 连续5根小阳线
+; ============================================================
+
+STRING_YANG:=((CLOSE>OPEN) AND (REF(CLOSE,1)>REF(OPEN,1))
+              AND (REF(CLOSE,2)>REF(OPEN,2))
+              AND (REF(CLOSE,3)>REF(OPEN,3))
+              AND (REF(CLOSE,4)>REF(OPEN,4)))
+             AND (ABS(CLOSE-OPEN)/OPEN<0.03)
+             AND (ABS(REF(CLOSE,1)-REF(OPEN,1))/REF(OPEN,1)<0.03);
+
+; ============================================================
+; 信号 #49: 见好就收 (卖出辅助)
+; 定义: Y = (MA13-MA55)/MA55 > 10%
+; ============================================================
+
+TAKE_PROFIT_SELL:=(M13-M55)/M55>0.1;
+
+; ============================================================
+; 信号 #55: 量能突破
+; 定义: 放量突破55日
+; ============================================================
+
+VOLUME_BREAK:=(CLOSE<REF(M55,1)) AND (CLOSE>M55)
+              AND (VOLUME>2*VOL_MA5)
+              AND (CLOSE>OPEN)
+              AND ((CLOSE-OPEN)/OPEN>0.03);
+
+; ============================================================
+; 第二部分: 卖出信号
+; ============================================================
+
+; 信号 #37: 分道扬镳 — 13日下穿34日
+PART_WAY:=(M13>REF(M34,1)) AND (M13<M34)
+          AND (M13>REF(M13,1)) AND (M13<=REF(M13,2))
+          AND (CLOSE<M13);
+
+; 信号 #38: 一箭穿心 — 13日下穿55日
+ARROW_HEART:=(CLOSE<M55) AND (M13>REF(M55,1)) AND (M13<M55);
+
+; 信号 #39: 一阴破三线
+YIN_BREAK:=(CLOSE<M13) AND (CLOSE<M34) AND (CLOSE<M55)
+           AND (OPEN>REF(M13,1))
+           AND (CLOSE<OPEN) AND (VOLUME>VOL_MA5);
+
+; 信号 #40: 落井下石 — 空头排列下跌
+FALL_STONE:=(CLOSE<REF(M55,3)) AND (CLOSE<REF(CLOSE,1))
+            AND (VOLUME>VOL_MA5)
+            AND (M13<M34) AND (M34<M55);
+
+; 信号 #47: 一剑封喉 — 上影线超实体3倍
+SWORD_THROAT:=ABS(CLOSE-OPEN)>0
+              AND ((HIGH-MAX(OPEN,CLOSE))/ABS(CLOSE-OPEN)>3)
+              AND (VOLUME>VOL_MA5)
+              AND (CLOSE<REF(CLOSE,1));
+
+; 信号 #48: 一枝独秀 — 高位放量长上影
+SINGLE_FLOWER:=ABS(CLOSE-OPEN)>0
+               AND ((HIGH-MAX(OPEN,CLOSE))/ABS(CLOSE-OPEN)>3)
+               AND (VOLUME>2*VOL_MA5)
+               AND (CLOSE<HIGH*0.95);
+
+; ============================================================
+; 第三部分: 共振信号 — 多信号同时出现时增强
+; ============================================================
+
+; 共振买入: 至少2个买入信号同时出现
+BUY_RESONANCE:=COUNT(RED_APRICOT+HACKER_CLICK+RED_GIRL+ONE_CANDLE_THREE
+                       +REBEL_RISE+FLOWERS_BLOOM+BOY_RETURN+THREE_ARMY,3);
+
+; 共振卖出: 至少2个卖出信号同时出现
+SELL_RESONANCE:=COUNT(PART_WAY+ARROW_HEART+YIN_BREAK+SWORD_THROAT,2);
+
+; ============================================================
+; 第四部分: 选股输出 — 条件选股公式
+; ============================================================
+
+{核心买点选股}
+{输入: 买入信号名称}
+{输出: 满足条件则返回1}
+
+XG_BUY:=(RED_APRICOT+HACKER_CLICK+RED_GIRL+ONE_CANDLE_THREE
+         +REBEL_RISE+FLOWERS_BLOOM+BOY_RETURN+SEA_FISHING
+         +THREE_ARMY+DMI_SURE+STRING_YANG+VOLUME_BREAK+GOLDEN_CAGE
+         +SUN_MOON)>0;
+
+{核心卖点选股}
+XG_SELL:=(PART_WAY+ARROW_HEART+YIN_BREAK+FALL_STONE
+          +SWORD_THROAT+SINGLE_FLOWER+TAKE_PROFIT_SELL)>0;
+
+{共振买入: 至少2个信号}
+XG_RESONANCE:=(RED_APRICOT+HACKER_CLICK+RED_GIRL+ONE_CANDLE_THREE
+               +REBEL_RISE+FLOWERS_BLOOM+BOY_RETURN+THREE_ARMY
+               +SEA_FISHING+DMI_SURE+STRING_YANG+VOLUME_BREAK)>1;
+
+{趋势向上: 均线多头排列}
+XG_TREND:=(M13>M34) AND (M34>M55) AND (M55>REF(M55,1));
+
+{金叉共振: 13上穿34且34上穿55}
+XG_CROSS:=M13>M34 AND REF(M13,1)<=REF(M34,1)
+          AND M34>M55 AND REF(M34,1)<=REF(M55,1);
+
+{DMI看涨共振}
+XG_DMI_RESONANCE:=(PDI14>MDI14) AND (PDI14>REF(MDI14,1))
+                  AND (ADX14>20) AND (M13>M55);
