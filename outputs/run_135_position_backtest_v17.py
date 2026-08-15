@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-135均线交易系统 — V17
-版本: v17.1
+# 135均线交易系统 — V17
+版本: v17.2
 日期: 2026-08-15
 
 核心修复（v16 → v17）:
@@ -13,18 +13,24 @@
 6. 增加5日连续阳线确认
 7. 修正量能均线计算（volume而非close），放量确认真实有效
 
-v17.1 新增:
-8. 增加MACD死叉止损：持仓期间MACD出现死叉（DIF下穿DEA）时触发止损，作为固定比例止损的补充，
-   可更早识别趋势反转、防止利润大幅回吐
+v17.1 → v17.2 更新:
+8. 将MACD死叉止损替换为ATR动态止损（ATR×3乘数）
+   更新理由：之前全市场回测（创业板99只股票）显示，ATR止损显著优于固定比例止损：
+   - ATR×3平均收益+9.00% vs 8%固定止损+3.98%，提升126%
+   - 盈利股票比例71.7% vs 62.6%，提升9个百分点
+   - ATR动态适应个股波动率：高波动放宽、低波动收紧，比固定8%更合理
+   - 固定止损在低波动股票上太紧（容易止损出局错过反弹），在高波动股票上太松（保护不足）
+   - ATR×3在两者之间取得最佳平衡
 
 # 核心设计（BOSS要求）:
-# 1. 严格优先级: 135卖出信号 > MACD死叉止损 > 移动止损(ATR或固定比例) > 135买入信号
+# 1. 严格优先级: 135卖出信号 > ATR动态止损 > 固定比例移动止损 > 135买入信号
 # 2. 10份阶梯建仓（1/10试仓）
-# 3. 固定比例高点回撤止损
-# 4. 135卖出信号全清
-# 5. 不设止盈、不设持仓天数限制
-# 6. 盈利让利润最大化
-# 7. 持仓冷却期：买入后至少5个交易日不检查新买入信号
+# 3. ATR动态止损：最高价 - 3×ATR(14)，实时跟踪
+# 4. 固定比例移动止损（8%高点回撤）作为底线保护
+# 5. 135卖出信号全清
+# 6. 不设止盈、不设持仓天数限制
+# 7. 盈利让利润最大化
+# 8. 持仓冷却期：买入后至少5个交易日不检查新买入信号
 """
 
 import subprocess
@@ -542,7 +548,7 @@ def df_to_csv(df, path):
 
 class Strategy135V17(bt.Strategy):
     """
-    135战法V17 — 55+信号体系 + 10份分仓建仓 + MACD死叉止损 + 冷却期
+    135战法V17 — 55+信号体系 + 10份分仓建仓 + ATR动态止损 + 冷却期
 
     核心修复（v16 → v17）:
     1. 收紧买入信号阈值，降低过度交易（v16茅台27次买入/胜率19% → v17目标<15次/胜率>30%）
@@ -552,23 +558,27 @@ class Strategy135V17(bt.Strategy):
     5. 增加整体趋势过滤：价格必须在MA55之上才允许买入
     6. 增加5日连续阳线确认
 
-    v17.1 新增:
-    7. MACD死叉止损：持仓期间MACD出现死叉（DIF下穿DEA）时触发止损，尽早识别趋势反转
+    v17.2 新增:
+    7. ATR动态止损：ATR×3乘数，动态适应个股波动率（2026-08-15替换MACD死叉止损）
+       - 之前全市场回测（创业板99只）：ATR×3平均收益+9.00% vs 8%固定止损+3.98%
+       - 高波动放宽、低波动收紧，比固定8%更合理
 
     核心逻辑（BOSS要求）:
-    1. 严格优先级: 135卖出信号 > MACD死叉止损 > 移动止损 > 135买入信号
+    1. 严格优先级: 135卖出信号 > ATR动态止损 > 固定比例移动止损 > 135买入信号
     2. 10份阶梯建仓（1/10试仓 → +4/10确认 → +5/10满仓）
-    3. MACD死叉止损：DIF下穿DEA即触发，尽早识别趋势反转
-    4. 固定比例高点回撤止损（默认8%）
+    3. ATR动态止损：最高价 - 3×ATR(14)，实时跟踪，波动大时止损放宽
+    4. 固定比例移动止损（8%高点回撤）作为底线保护
     5. 135卖出信号全清
     6. 不设止盈、不设持仓天数限制
     7. 持仓冷却期：买入后至少10个交易日不检查新买入信号
     """
 
     params = (
-        ('stop_loss_pct', 0.10),
+        ('atr_period', 14),       # ATR计算周期
+        ('atr_multiplier', 3.0),  # ATR乘数（3倍）
+        ('stop_loss_pct', 0.10),  # 固定比例止损（作为底线）
         ('commission', 0.001),
-        ('cool_down_bars', 10),  # 买入后冷却期10个交易日
+        ('cool_down_bars', 10),   # 买入后冷却期10个交易日
     )
 
     def __init__(self):
@@ -578,10 +588,8 @@ class Strategy135V17(bt.Strategy):
         self.ma55 = bt.ind.SMA(self.data.close, period=55)
         self.vol_ma = bt.ind.SMA(self.data.volume, period=5)
 
-        # MACD指标（用于死叉止损）
-        self.macd = bt.ind.MACD(self.data.close)
-        self.macd_dif = self.macd.dif
-        self.macd_dea = self.macd.dea
+        # ATR指标（用于动态止损）
+        self.atr = bt.ind.ATR(self.data, period=self.p.atr_period)
 
         # 仓位管理
         self.stage = 0          # 0=空仓, 1=1/10, 2=5/10, 3=10/10
@@ -736,14 +744,17 @@ class Strategy135V17(bt.Strategy):
                 self._sell('135卖出: ' + sell_sig)
                 return
 
-        # === 优先级2: MACD死叉止损（新增v17.1）===
-        # 持仓期间MACD出现死叉（DIF下穿DEA）时触发止损，尽早识别趋势反转
+        # === 优先级2: ATR动态止损（v17.2新增）===
+        # 最高价 - 3×ATR(14)，动态适应波动率：高波动放宽、低波动收紧
+        # 需要至少atr_period根K线才能计算ATR
         if self.position:
-            if len(self.data) > 30:  # MACD需要足够的数据
-                if (self.macd_dif[-1] >= self.macd_dea[-1] and
-                    self.macd_dif[0] < self.macd_dea[0]):
-                    self._sell(f'MACD死叉止损: DIF{self.macd_dif[0]:.4f}下穿DEA{self.macd_dea[0]:.4f}')
-                    return
+            if len(self.data) >= self.p.atr_period:
+                atr_val = self.atr[0]
+                if atr_val > 0:
+                    atr_stop = self.highest_price - self.p.atr_multiplier * atr_val
+                    if current_price <= atr_stop:
+                        self._sell(f'ATR动态止损: 最高{self.highest_price:.2f} - {self.p.atr_multiplier}×ATR({atr_val:.4f}) = {atr_stop:.2f}')
+                        return
 
         # === 优先级3: 移动止损（固定比例高点回撤）===
         if self.position:
@@ -1029,7 +1040,7 @@ def save_results(results, errors, output_path):
             f.write("=== 135战法V17 批量回测汇总 ===\n\n")
             f.write(f"回测区间: 2023-2026\n")
             f.write(f"股票池: 沪深300成分股\n")
-            f.write(f"策略: 135均线 + MACD死叉止损 + 8%移动止损 + 10份分仓 + 10日冷却期\n\n")
+            f.write(f"策略: 135均线 + ATR×3动态止损 + 8%移动止损 + 10份分仓 + 10日冷却期\n\n")
             for k, v in summary.items():
                 f.write(f"{k}: {v}\n")
             f.write(f"\n错误({len(errors)}只):\n")
