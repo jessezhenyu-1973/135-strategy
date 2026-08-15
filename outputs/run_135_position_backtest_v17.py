@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 135均线交易系统 — V17
-版本: v17.0
-日期: 2026-08-14
+版本: v17.1
+日期: 2026-08-15
 
 核心修复（v16 → v17）:
 1. 收紧买入信号阈值，降低过度交易（v16茅台27次买入/胜率19% → v17目标<15次/胜率>30%）
@@ -13,14 +13,18 @@
 6. 增加5日连续阳线确认
 7. 修正量能均线计算（volume而非close），放量确认真实有效
 
-核心设计（BOSS要求）:
-1. 严格优先级: 135卖出信号 > 移动止损8% > 135买入信号
-2. 10份阶梯建仓（1/10试仓）
-3. 8%高点回撤止损
-4. 135卖出信号全清
-5. 不设止盈、不设持仓天数限制
-6. 盈利让利润最大化
-7. 持仓冷却期：买入后至少5个交易日不检查新买入信号
+v17.1 新增:
+8. 增加MACD死叉止损：持仓期间MACD出现死叉（DIF下穿DEA）时触发止损，作为固定比例止损的补充，
+   可更早识别趋势反转、防止利润大幅回吐
+
+# 核心设计（BOSS要求）:
+# 1. 严格优先级: 135卖出信号 > MACD死叉止损 > 移动止损(ATR或固定比例) > 135买入信号
+# 2. 10份阶梯建仓（1/10试仓）
+# 3. 固定比例高点回撤止损
+# 4. 135卖出信号全清
+# 5. 不设止盈、不设持仓天数限制
+# 6. 盈利让利润最大化
+# 7. 持仓冷却期：买入后至少5个交易日不检查新买入信号
 """
 
 import subprocess
@@ -477,19 +481,44 @@ def get_stock_history(thscode, start_date='20230101', end_date='20260813'):
     except:
         return None
 
-    items = data.get('data', {}).get('item', [])
+    raw_data = data.get('data', [])
+    # API format: data can be a list directly or nested under 'item'
+    if isinstance(raw_data, dict):
+        items = raw_data.get('item', [])
+    elif isinstance(raw_data, list):
+        items = raw_data
+    else:
+        return None
     if not items:
         return None
 
     df = pd.DataFrame(items)
-    df['date'] = pd.to_datetime(df['date_ms'], unit='ms')
+
+    # Normalize column names (API returns 'open/close/high/low/volume' or 'open_price/close_price/etc.')
+    col_map = {}
+    for c in ['open', 'high', 'low', 'close', 'volume']:
+        if c not in df.columns and f'{c}_price' in df.columns:
+            col_map[f'{c}_price'] = c
+    if col_map:
+        df.rename(columns=col_map, inplace=True)
+
+    # Handle date_ms vs date column
+    if 'date_ms' in df.columns:
+        df['date'] = pd.to_datetime(df['date_ms'], unit='ms')
+    elif 'date' in df.columns:
+        if df['date'].dtype == 'int64' or df['date'].dtype == 'float64':
+            df['date'] = pd.to_datetime(df['date'], unit='ms')
+        else:
+            df['date'] = pd.to_datetime(df['date'])
     df.set_index('date', inplace=True)
     df = df.sort_index()
 
-    df.rename(columns={
-        'open_price': 'open', 'high_price': 'high', 'low_price': 'low',
-        'close_price': 'close', 'volume': 'volume',
-    }, inplace=True)
+    if 'volume' not in df.columns:
+        # Some API versions use 'vol' or other names
+        if 'vol' in df.columns:
+            df['volume'] = df['vol']
+        else:
+            return None
 
     df = df[(df['close'] > 0) & (df['volume'] >= 0)]
 
@@ -513,7 +542,7 @@ def df_to_csv(df, path):
 
 class Strategy135V17(bt.Strategy):
     """
-    135战法V17 — 55+信号体系 + 10份分仓建仓 + 8%移动止损 + 冷却期
+    135战法V17 — 55+信号体系 + 10份分仓建仓 + MACD死叉止损 + 冷却期
 
     核心修复（v16 → v17）:
     1. 收紧买入信号阈值，降低过度交易（v16茅台27次买入/胜率19% → v17目标<15次/胜率>30%）
@@ -523,18 +552,21 @@ class Strategy135V17(bt.Strategy):
     5. 增加整体趋势过滤：价格必须在MA55之上才允许买入
     6. 增加5日连续阳线确认
 
+    v17.1 新增:
+    7. MACD死叉止损：持仓期间MACD出现死叉（DIF下穿DEA）时触发止损，尽早识别趋势反转
+
     核心逻辑（BOSS要求）:
-    1. 严格优先级: 135卖出信号 > 移动止损8% > 135买入信号
+    1. 严格优先级: 135卖出信号 > MACD死叉止损 > 移动止损 > 135买入信号
     2. 10份阶梯建仓（1/10试仓 → +4/10确认 → +5/10满仓）
-    3. 8%高点回撤止损
-    4. 135卖出信号全清
-    5. 不设止盈、不设持仓天数限制
-    6. 盈利让利润最大化
-    7. 持仓冷却期：买入后至少5个交易日不检查新买入信号
+    3. MACD死叉止损：DIF下穿DEA即触发，尽早识别趋势反转
+    4. 固定比例高点回撤止损（默认8%）
+    5. 135卖出信号全清
+    6. 不设止盈、不设持仓天数限制
+    7. 持仓冷却期：买入后至少10个交易日不检查新买入信号
     """
 
     params = (
-        ('stop_loss_pct', 0.08),
+        ('stop_loss_pct', 0.10),
         ('commission', 0.001),
         ('cool_down_bars', 10),  # 买入后冷却期10个交易日
     )
@@ -545,6 +577,11 @@ class Strategy135V17(bt.Strategy):
         self.ma34 = bt.ind.SMA(self.data.close, period=34)
         self.ma55 = bt.ind.SMA(self.data.close, period=55)
         self.vol_ma = bt.ind.SMA(self.data.volume, period=5)
+
+        # MACD指标（用于死叉止损）
+        self.macd = bt.ind.MACD(self.data.close)
+        self.macd_dif = self.macd.dif
+        self.macd_dea = self.macd.dea
 
         # 仓位管理
         self.stage = 0          # 0=空仓, 1=1/10, 2=5/10, 3=10/10
@@ -677,6 +714,20 @@ class Strategy135V17(bt.Strategy):
 
         current_price = self.data.close[0]
 
+        # === 更新最高价（必须在检查止损之前）===
+        if self.position:
+            if self.highest_price == 0:
+                self.highest_price = current_price
+            else:
+                if current_price > self.highest_price:
+                    self.highest_price = current_price
+            # === 移动止损（8%高点回撤）===
+            if self.highest_price > 0:
+                drawdown = (self.highest_price - current_price) / self.highest_price
+                if drawdown >= self.p.stop_loss_pct:
+                    self._sell(f'移动止损8%回撤: 最高{self.highest_price:.2f} → 当前{current_price:.2f}')
+                    return
+
         # === 优先级1: 135卖出信号（最高优先级）===
         if self.position:
             sell_sig = self._check_sell_signals()
@@ -685,16 +736,25 @@ class Strategy135V17(bt.Strategy):
                 self._sell('135卖出: ' + sell_sig)
                 return
 
-            # === 优先级2: 移动止损（8%高点回撤）===
+        # === 优先级2: MACD死叉止损（新增v17.1）===
+        # 持仓期间MACD出现死叉（DIF下穿DEA）时触发止损，尽早识别趋势反转
+        if self.position:
+            if len(self.data) > 30:  # MACD需要足够的数据
+                if (self.macd_dif[-1] >= self.macd_dea[-1] and
+                    self.macd_dif[0] < self.macd_dea[0]):
+                    self._sell(f'MACD死叉止损: DIF{self.macd_dif[0]:.4f}下穿DEA{self.macd_dea[0]:.4f}')
+                    return
+
+        # === 优先级3: 移动止损（固定比例高点回撤）===
+        if self.position:
+            # === 移动止损（8%高点回撤）===
             if self.highest_price > 0:
                 drawdown = (self.highest_price - current_price) / self.highest_price
                 if drawdown >= self.p.stop_loss_pct:
                     self._sell(f'移动止损8%回撤: 最高{self.highest_price:.2f} → 当前{current_price:.2f}')
                     return
-            else:
-                self.highest_price = current_price
 
-        # === 优先级3: 135买入信号（空仓且不在冷却期）===
+        # === 优先级4: 135买入信号（空仓且不在冷却期）===
         if not self.position:
             # 检查冷却期：买入后至少cool_down_bars个交易日
             if (self.buy_bar >= 0 and
@@ -828,7 +888,7 @@ class Strategy135V17(bt.Strategy):
 # ============================================================
 
 def run_single_backtest(thscode, start_date='20230101', end_date='20260813',
-                        initial_cash=1000000, stop_loss=0.08):
+                        initial_cash=1000000, stop_loss=0.10):
     """单只股票回测（同花顺数据源）"""
     df = get_stock_history(thscode, start_date, end_date)
     if df is None or len(df) < 60:
@@ -925,7 +985,7 @@ def run_single_backtest(thscode, start_date='20230101', end_date='20260813',
 
 
 def run_batch_backtest(codes, start_date='20230101', end_date='20260813',
-                        initial_cash=1000000, stop_loss=0.08):
+                        initial_cash=1000000, stop_loss=0.10):
     """批量回测"""
     results = []
     errors = []
@@ -969,7 +1029,7 @@ def save_results(results, errors, output_path):
             f.write("=== 135战法V17 批量回测汇总 ===\n\n")
             f.write(f"回测区间: 2023-2026\n")
             f.write(f"股票池: 沪深300成分股\n")
-            f.write(f"策略: 135均线 + 8%移动止损 + 10份分仓 + 5日冷却期\n\n")
+            f.write(f"策略: 135均线 + MACD死叉止损 + 8%移动止损 + 10份分仓 + 10日冷却期\n\n")
             for k, v in summary.items():
                 f.write(f"{k}: {v}\n")
             f.write(f"\n错误({len(errors)}只):\n")
@@ -983,10 +1043,31 @@ def save_results(results, errors, output_path):
 # 主函数
 # ============================================================
 
+def get_chi_next_codes():
+    """从同花顺获取创业板成分股列表（399006.SZ，筛选300/301开头）"""
+    result = subprocess.run([
+        'hithink-finance', 'index', 'constituents',
+        '--thscode', '399006.SZ',
+        '--format', 'json'
+    ], capture_output=True, text=True)
+
+    if result.returncode != 0:
+        print(f"获取创业板成分股失败: {result.stderr}")
+        return []
+
+    data = json.loads(result.stdout)
+    items = data.get('data', {}).get('item', [])
+    # 创业板股票代码以300或301开头
+    return [item.get('thscode', '') for item in items 
+            if item.get('thscode', '').startswith(('300', '301'))]
+
+
 def main():
     parser = argparse.ArgumentParser(description='135战法V17回测')
-    parser.add_argument('--code', type=str, help='单只股票回测（如600519.SH）')
+    parser.add_argument('--code', type=str, help='单只股票回测（如300750.SZ）')
     parser.add_argument('--top', type=int, default=0, help='前N只沪深300成分股')
+    parser.add_argument('--czs', action='store_true', help='使用创业板全市场回测（399006.SZ成分股）')
+    parser.add_argument('--top-czs', type=int, default=0, help='前N只创业板成分股')
     parser.add_argument('--start', type=str, default='20230101', help='起始日期')
     parser.add_argument('--end', type=str, default='20260813', help='结束日期')
     parser.add_argument('--capital', type=float, default=1000000, help='初始资金')
@@ -1013,35 +1094,94 @@ def main():
         print(f"信号类型: {result['buy_signal_names']}")
 
     elif args.top > 0:
-        # 批量回测
+        # 沪深300批量回测
         print("获取沪深300成分股...")
         codes = get_hs300_codes()[:args.top]
         if not codes:
             print("获取成分股失败")
             return
 
-        print(f"开始批量回测 {len(codes)} 只股票...")
+        print(f"开始批量回测 {len(codes)} 只沪深300股票...")
         results, errors = run_batch_backtest(
             codes, args.start, args.end, args.capital, args.stop_loss)
 
         if results:
-            save_results(results, errors, '/tmp/135_v16_results.csv')
+            save_results(results, errors, '/tmp/135_v17_hs300_results.csv')
 
             # 汇总
             avg_ret = sum(r['total_return'] for r in results) / len(results)
             avg_sharpe = sum(r['sharpe'] for r in results) / len(results)
             profitable = len([r for r in results if r['total_return'] > 0])
             print(f"\n{'='*60}")
-            print(f"135战法V17 批量回测汇总")
+            print(f"135战法V17 批量回测汇总（沪深300）")
             print(f"{'='*60}")
             print(f"股票数: {len(results)}/{len(codes)}")
             print(f"盈利: {profitable} | 亏损: {len(results)-profitable}")
             print(f"平均收益: {avg_ret:+.2f}%")
             print(f"平均夏普: {avg_sharpe}")
-            print(f"结果文件: /tmp/135_v16_results.csv")
+            print(f"结果文件: /tmp/135_v17_hs300_results.csv")
+
+    elif args.top_czs > 0:
+        # 创业板前N只
+        print("获取创业板成分股...")
+        codes = get_chi_next_codes()[:args.top_czs]
+        if not codes:
+            print("获取创业板成分股失败")
+            return
+        print(f"创业板股票数: {len(codes)}")
+
+        print(f"开始批量回测 {len(codes)} 只创业板股票...")
+        results, errors = run_batch_backtest(
+            codes, args.start, args.end, args.capital, args.stop_loss)
+
+        if results:
+            save_results(results, errors, '/tmp/135_v17_czs_results.csv')
+
+            avg_ret = sum(r['total_return'] for r in results) / len(results)
+            avg_sharpe = sum(r['sharpe'] for r in results) / len(results)
+            profitable = len([r for r in results if r['total_return'] > 0])
+            print(f"\n{'='*60}")
+            print(f"135战法V17 批量回测汇总（创业板 Top {args.top_czs}）")
+            print(f"{'='*60}")
+            print(f"股票数: {len(results)}/{len(codes)}")
+            print(f"盈利: {profitable} | 亏损: {len(results)-profitable}")
+            print(f"平均收益: {avg_ret:+.2f}%")
+            print(f"平均夏普: {avg_sharpe}")
+            print(f"结果文件: /tmp/135_v17_czs_results.csv")
+
+    elif args.czs:
+        # 创业板全市场
+        print("获取创业板成分股...")
+        codes = get_chi_next_codes()
+        if not codes:
+            print("获取创业板成分股失败")
+            return
+        print(f"创业板股票总数: {len(codes)}")
+
+        print(f"开始批量回测 {len(codes)} 只创业板股票...")
+        results, errors = run_batch_backtest(
+            codes, args.start, args.end, args.capital, args.stop_loss)
+
+        if results:
+            save_results(results, errors, '/tmp/135_v17_czs_all_results.csv')
+
+            avg_ret = sum(r['total_return'] for r in results) / len(results)
+            avg_sharpe = sum(r['sharpe'] for r in results) / len(results)
+            profitable = len([r for r in results if r['total_return'] > 0])
+            print(f"\n{'='*60}")
+            print(f"135战法V17 批量回测汇总（创业板全市场）")
+            print(f"{'='*60}")
+            print(f"股票数: {len(results)}/{len(codes)}")
+            print(f"盈利: {profitable} | 亏损: {len(results)-profitable}")
+            print(f"平均收益: {avg_ret:+.2f}%")
+            print(f"平均夏普: {avg_sharpe}")
+            print(f"结果文件: /tmp/135_v17_czs_all_results.csv")
     else:
-        print("用法: python3 run_135_position_backtest_v17.py --code 600519.SH")
-        print("      python3 run_135_position_backtest_v17.py --top 300")
+        print("用法:")
+        print("  python3 run_135_position_backtest_v17.py --code 300750.SZ        # 单票")
+        print("  python3 run_135_position_backtest_v17.py --top 300              # 沪深300前300只")
+        print("  python3 run_135_position_backtest_v17.py --czs                  # 创业板全市场")
+        print(f"  python3 run_135_position_backtest_v17.py --stop-loss 0.10  # 止损比例（默认10%）")
 
 
 if __name__ == '__main__':
