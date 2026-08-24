@@ -1,0 +1,14 @@
+{135战法 V18-ATR 止损监控主图指标
+ 显示: 13/34/55均线 + ATR追踪止损线(基于近20日最高价)
+ 用法: 功能->公式系统->公式管理器->技术指标公式->新建, 主图叠加
+ 说明: 实盘请以自己实际买入价为基准手动记录最高价;
+       本指标的止损线用近20日最高价近似, 仅供盘面参考}
+MA13:MA(CLOSE,13),COLORWHITE;
+MA34:MA(CLOSE,34),COLORYELLOW;
+MA55:MA(CLOSE,55),COLORMAGENTA;
+
+TR1:=MAX(MAX(HIGH-LOW,ABS(HIGH-REF(CLOSE,1))),ABS(LOW-REF(CLOSE,1)));
+ATR14:=MA(TR1,14);
+
+HH20:=HHV(HIGH,20);
+ATRSTOP:HH20-2.5*ATR14,COLORGREEN,LINETHICK2;

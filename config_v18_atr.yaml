@@ -1,0 +1,56 @@
+# ============================================================
+# 135战法 V18-ATR 最终配置（固化）
+# 冻结日期: 2026-08-24
+# 验证: 任务10b(ATR止损, 全池63%占优) + 任务11(联合验证, 收益回撤比1.63)
+# ============================================================
+
+version: "V18-ATR"
+frozen_date: "2026-08-24"
+
+signal:
+  # ---- 前置过滤（全部通过才评估买入信号）----
+  filters:
+    no_downtrend: true          # MA13<MA34<MA55 且三线齐跌 → 禁止买入
+    price_above_ma55: true      # 收盘价 > MA55
+    ma55_decline_limit: 0.05    # MA55五日跌幅>5% → 禁止买入
+
+  buy_signals:                  # 三选一触发即买
+    - name: 红杏出墙
+      conditions:
+        ma13_rising_2d: true       # MA13连续2日向上
+        close_above_ma13: true     # 收盘价站上MA13
+        bullish_alignment: true    # MA13>MA34>MA55
+        yang_line: true            # 阳线
+        vol_mult: 1.0              # 量能>5日均量
+    - name: 一阳穿三线
+      conditions:
+        yang_open_below_3ma: true  # 开盘低于MA13/34/55
+        yang_close_above_3ma: true # 收盘高于三条均线
+        vol_mult: 2.0              # 量能>5日均量2倍
+    - name: 揭竿而起
+      conditions:
+        ma_spread_max: 0.015       # 当日三线黏合≤1.5%
+        avg_spread_5d_max: 0.02    # 近5日均黏合<2%
+        vol_mult: 2.0
+        close_above_3ma: true
+
+  exit:                         # ★ V18变更: 移除一箭穿心
+    yijianchuanxin_removed: true
+    atr_stop:
+      method: chandelier        # stop = 最高价 − mult × ATR(14)
+      period: 14
+      mult: 2.5
+      note: "替代原8%固定移动止损; 无止盈"
+
+portfolio:
+  initial_cash: 200000          # 实盘跟踪本金(任务12)
+  position_pct: 0.10            # 单笔=总资产10%
+  max_positions: 5              # 同时最多5只(总敞口50%)
+  allocation: first_come_first_served
+  cool_down_bars: 10            # 卖出后10个交易日冷却
+
+monitoring:                     # 任务12实盘跟踪监控清单
+  - floating_pnl_ratio          # 未平仓浮盈占总权益比(预期会很高)
+  - atr_washout_count           # 被ATR洗出次数 vs 固定8%对比
+  - monthly_realized_trades     # 月均已平仓交易数(预期<1)
+  - review_if_no_winner_12m     # 12个月无大赢家兑现→复查参数
