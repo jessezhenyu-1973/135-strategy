@@ -1,0 +1,63 @@
+{135战法 V18-ATR 选股公式 V2
+ 信号: 红杏出墙 / 一阳穿三线 / 揭竿而起 (三选一触发)
+ 前置过滤: 非下降趋势 + 收盘>MA55 + MA55五日跌幅<=5%
+ 适用: 通达信/招商证券交易软件, 日线周期
+ 导入: 功能->公式系统->公式管理器->条件选股公式->新建
+}
+
+{===== 均线与量能 =====}
+MA13:=MA(CLOSE,13);
+MA34:=MA(CLOSE,34);
+MA55:=MA(CLOSE,55);
+VOLMA5:=MA(VOL,5);
+
+{===== ATR(14) 用于止损参考输出 =====}
+TR1:=MAX(MAX(HIGH-LOW,ABS(HIGH-REF(CLOSE,1))),ABS(LOW-REF(CLOSE,1)));
+ATR14:=MA(TR1,14);
+
+{===== 前置过滤 =====}
+{非下降趋势: 排除 MA13<MA34<MA55 且三线齐跌}
+NOT_DOWNTREND := NOT(MA13<MA34 AND MA34<MA55
+                 AND MA13<REF(MA13,1) AND REF(MA13,1)<REF(MA13,2)
+                 AND MA34<REF(MA34,1) AND REF(MA34,1)<REF(MA34,2)
+                 AND MA55<REF(MA55,1) AND REF(MA55,1)<REF(MA55,2));
+
+{收盘站上MA55}
+ABOVE_MA55 := CLOSE>MA55;
+
+{MA55近5日跌幅<=5%}
+MA55_STABLE := MA55>0 AND (REF(MA55,5)-MA55)/REF(MA55,5)<=0.05;
+
+FILTER_OK := NOT_DOWNTREND AND ABOVE_MA55 AND MA55_STABLE;
+
+{===== 买入信号① 红杏出墙 =====}
+HONGXING := REF(MA13,2)<=REF(MA13,1)          {前2日MA13不高于前1日}
+        AND MA13>REF(MA13,1)                   {今日MA13向上}
+        AND CLOSE>MA13                          {收盘站上MA13}
+        AND CLOSE>OPEN                          {阳线}
+        AND VOL>VOLMA5                          {放量}
+        AND MA13>MA34 AND MA34>MA55;            {多头排列}
+
+{===== 买入信号② 一阳穿三线 =====}
+YIYANGCHUAN := CLOSE>OPEN
+        AND OPEN<MA13 AND OPEN<MA34 AND OPEN<MA55
+        AND CLOSE>MA13 AND CLOSE>MA34 AND CLOSE>MA55
+        AND VOL>VOLMA5*2;
+
+{===== 买入信号③ 揭竿而起 =====}
+SPREAD := (MAX(MA13,MAX(MA34,MA55))-MIN(MA13,MIN(MA34,MA55)))/MAX(MA13,MAX(MA34,MA55));
+AVGSPREAD := ( SPREAD
+       + (MAX(REF(MA13,1),MAX(REF(MA34,1),REF(MA55,1)))-MIN(REF(MA13,1),MIN(REF(MA34,1),REF(MA55,1))))/MAX(REF(MA13,1),MAX(REF(MA34,1),REF(MA55,1)))
+       + (MAX(REF(MA13,2),MAX(REF(MA34,2),REF(MA55,2)))-MIN(REF(MA13,2),MIN(REF(MA34,2),REF(MA55,2))))/MAX(REF(MA13,2),MAX(REF(MA34,2),REF(MA55,2)))
+       + (MAX(REF(MA13,3),MAX(REF(MA34,3),REF(MA55,3)))-MIN(REF(MA13,3),MIN(REF(MA34,3),REF(MA55,3))))/MAX(REF(MA13,3),MAX(REF(MA34,3),REF(MA55,3)))
+       + (MAX(REF(MA13,4),MAX(REF(MA34,4),REF(MA55,4)))-MIN(REF(MA13,4),MIN(REF(MA34,4),REF(MA55,4))))/MAX(REF(MA13,4),MAX(REF(MA34,4),REF(MA55,4)))
+       ) / 5;
+
+JIEGAN := VOL>VOLMA5*2
+        AND CLOSE>OPEN
+        AND SPREAD<0.015
+        AND AVGSPREAD<0.02
+        AND CLOSE>MA13 AND CLOSE>MA34 AND CLOSE>MA55;
+
+{===== 综合选股条件 =====}
+BUY_SIGNAL: FILTER_OK AND (HONGXING OR YIYANGCHUAN OR JIEGAN);
