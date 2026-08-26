@@ -11,11 +11,30 @@
 import os
 import sys
 import json
+import subprocess
 import argparse
 import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from run_param_sensitivity import get_hs300_codes, get_stock_history
+
+def get_all_mainboard_codes():
+    """全市场沪深A股(主板+创业板): 排除北交所、科创板(688)、ST/退市股"""
+    result = subprocess.run([
+        'hithink-finance', 'symbol', 'list',
+        '--limit', '10000', '--format', 'json'
+    ], capture_output=True, text=True)
+    if result.returncode != 0:
+        return []
+    data = json.loads(result.stdout)
+    items = data.get('data', {}).get('item', [])
+    prefixes = ('600', '601', '603', '605', '000', '001', '002', '003',
+                '300', '301')  # 主板 + 创业板
+    codes = [i['thscode'] for i in items
+             if i.get('thscode', '').startswith(prefixes)
+             and 'ST' not in i.get('name', '') and '退' not in i.get('name', '')]
+    return codes
+
 
 import pandas as pd
 
@@ -95,7 +114,7 @@ def atr_stop_level(df, period=14, mult=2.5):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--pool', choices=['hs300'], default='hs300')
+    parser.add_argument('--pool', choices=['hs300', 'all'], default='all')
     parser.add_argument('--watch', type=str, help='逗号分隔的持仓代码, 输出ATR止损位')
     args = parser.parse_args()
 
@@ -112,14 +131,28 @@ def main():
             print(f"{code}: 现价{cur:.2f} | 止损位{stop:.2f} | {status}")
         return
 
-    print("获取沪深300成分股...")
-    codes = get_hs300_codes(300)
+    if args.pool == 'all':
+        print("获取全市场沪深A股(主板+创业板, 排除北交所/科创板/ST)...")
+        codes = get_all_mainboard_codes()
+    else:
+        print("获取沪深300成分股...")
+        codes = get_hs300_codes(300)
     print(f"共{len(codes)}只, 开始扫描...\n")
 
     hits = []
+    today = datetime.datetime.now().strftime('%Y%m%d')
     for i, code in enumerate(codes):
-        df = get_stock_history(code)
+        df = get_stock_history(code, start_date='20230101', end_date=today)
         if df is None:
+            continue
+        # 排除停牌股: 最新5根K线内有0成交量或最新日期距今超过7天视为停牌/无数据
+        last_date = df.index[-1]
+        if isinstance(last_date, tuple):
+            continue
+        days_since = (datetime.datetime.now() - last_date.to_pydatetime()).days
+        if days_since > 7:
+            continue
+        if (df['volume'].tail(5) == 0).any():
             continue
         sig, detail = check_signals(df)
         if sig:
