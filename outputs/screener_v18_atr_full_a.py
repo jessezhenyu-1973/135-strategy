@@ -33,6 +33,7 @@ import os
 import sys
 import json
 import math
+import time
 import argparse
 import datetime
 import concurrent.futures as cf
@@ -153,6 +154,30 @@ def load_history(con, thscode, bars=120):
         return None
     df = df.sort_values('date').reset_index(drop=True)
     return df
+
+
+def load_all_history(con, days=220):
+    """一次性把全市场近 days 天日K读进内存(单连接), 返回 (alldf, latest)。
+    之后 scan 阶段零 DuckDB IO, 仅按 thscode 切片。约0.5s。
+    """
+    latest = con.execute("SELECT MAX(date) FROM v_daily").fetchone()[0]
+    cut = latest - datetime.timedelta(days=days)
+    alldf = con.execute("""
+        SELECT thscode, date, open, high, low, close, volume, amount
+        FROM v_daily
+        WHERE date >= ?
+        ORDER BY thscode, date
+    """, [cut]).fetchdf()
+    return alldf, latest
+
+
+def load_history_mem(memdict, thscode, bars=120):
+    """从预建分组字典 {thscode: subdf} 取该股票数据(微秒级 O(1))。"""
+    sub = memdict.get(thscode)
+    if sub is None or len(sub) < 60:
+        return None
+    sub = sub.sort_values('date').reset_index(drop=True)
+    return sub.tail(bars) if len(sub) > bars else sub
 
 
 def check_signals(df):
@@ -289,11 +314,11 @@ def load_listing_dates_smart(con, latest):
 
 
 def scan_one(args_tuple):
-    """单只股票扫描 worker (线程安全: 各自建 DuckDB 连接).
+    """单只股票扫描 worker (内存模式: 从 alldf 切片, 零 DuckDB IO).
 
     返回 dict (命中) 或 None. 已做 ST/次新/停牌 硬过滤.
     """
-    code, name, db_path, latest, new_stock_cutoff, small_cap_thr, listing_map, main_fund_map = args_tuple
+    code, name, alldf, latest, new_stock_cutoff, small_cap_thr, listing_map, main_fund_map = args_tuple
     # ST 过滤
     if is_st(code, name):
         return None
@@ -302,9 +327,7 @@ def scan_one(args_tuple):
     if listing is not None and listing >= new_stock_cutoff:
         return None
     try:
-        con = duckdb.connect(db_path, read_only=True)
-        df = load_history(con, code)
-        con.close()
+        df = load_history_mem(alldf, code)
     except Exception:
         return None
     if df is None:
@@ -355,9 +378,16 @@ def main():
     universe, latest = get_universe(con)
     # 多源冗余上市日: 优先 tushare/akshare(7天缓存) -> 失败回退本地 DuckDB MIN(date)
     listing_map, listing_src = load_listing_dates_smart(con, latest)
+    # 一次性把全市场近220天日K读进内存(单连接, ~0.5s), 之后扫描零DuckDB IO
+    t_load = time.time()
+    alldf, _ = load_all_history(con, days=220)
+    # 预建 {thscode: subdf} 分组字典(O(1) 取数, 避免逐股布尔索引全表扫描)
+    memdict = {k: v for k, v in alldf.groupby('thscode', sort=False)}
     con.close()
+    load_secs = time.time() - t_load
     print(f"[扫描] 全市场最新交易日: {latest}  候选池(剔除科创/北交): {len(universe)} 只")
     print(f"[上市日源] {listing_src} ({len(listing_map)} 只)")
+    print(f"[内存] 全市场日K载入+分组: {len(alldf)} 行 / {len(memdict)} 只, 耗时{load_secs:.1f}s")
     print(f"[过滤] 排除上市<{args.new_stock_days}天次新股; 小盘阈值=总市值<{args.small_cap_thr}亿; 并发={args.concurrency}")
 
     new_stock_cutoff = latest - datetime.timedelta(days=args.new_stock_days)
@@ -386,7 +416,7 @@ def main():
         except Exception as e:
             print(f"  [warn] 主力资金榜加载失败(跳过加权): {e}")
 
-    tasks = [(code, name, args.db, latest, new_stock_cutoff, args.small_cap_thr,
+    tasks = [(code, name, memdict, latest, new_stock_cutoff, args.small_cap_thr,
               listing_map, main_fund_map) for code, name in universe]
 
     hits = []
