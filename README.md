@@ -251,6 +251,13 @@ python outputs/stock_screener.py --workers 16    # 手动调并发数
 - **v14** (2026-08-14): 10份阶梯建仓 + 7%移动止损
 - **v1.0–v1.1** (2026-08-13): 初始版本
 
+## 运维与协作（回溯用）
+
+- **实盘主分支**：`feat/v18-atr-final` 为实盘主仓库（含 V18 选股/止损公式 + 预筛/并发/tushare 全部改动）；`main` 与之对齐。研究阶段已结束，后续改动均在此分支进行。V18 的**选股公式**(`outputs/135_v18_atr_tdx_formula.txt`)、**止损主图公式**(`outputs/135_v18_atr_tdx_stopline.txt`)、**配置固化**(`config_v18_atr.yaml`) 是每日 14:30 选股任务的基础，合并/重构时务必先 diff 这三个文件。
+- **GitHub 网络**：本机命令行直连 github.com 会被 GnuTLS TLS 重置。已在本机运行 v2rayN(xray)，监听 `127.0.0.1:10808`。需先配置 `git config --global http.proxy socks5h://127.0.0.1:10808`（socks5h 的 h 表示代理做 DNS 解析，避免本地 DNS 污染），之后 fetch/push 正常。注意：用户说"开了代理"往往指本机 GUI 代理，命令行工具需显式配置；先用 `ss -tlnp` 找 xray/v2ray 实际监听端口。
+- **数据源接入约定**：预筛模块 `outputs/prefilter_universe.py` 多源冗余 —— 上市日【主 tushare → 兜底 akshare】+ 市值【腾讯行情批量】。token/密钥一律存 `~/.tushare_token`(chmod 600) 等家目录受保护文件，**绝不进脚本/对话明文/仓库**。新数据源接入时遵循：① 敏感信息走环境变量或 ~/. 文件 ② 限频源(tushare 免费版 stock_basic 1次/小时)必须加本地缓存层(`.listdate_cache.json`, 7天有效)避免热路径撞限频 ③ 主源失败自动回退兜底源。
+- **运行产物不入库**：`.listdate_cache.json`、`screener_today.json` 已加 `.gitignore`（派生数据，会随时间变），提交时勿 `git add -A` 误带。
+
 ## 下一步
 
 1. **小资金实盘跟踪**（任务12）: 20万本金按 V18-ATR 配置运行3个月，重点监控浮盈占比与被洗出频率
