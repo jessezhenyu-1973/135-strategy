@@ -7,7 +7,15 @@ dist/
 build/
 .eggs/
 *.csv.bak
-outputs/.listdate_cache.json
-outputs/.prefilter_cache.json
-outputs/screener_today.json
 
+# 运行时产物 / 缓存 (由脚本动态生成, 不进版本库)
+outputs/market_cap.json
+outputs/st_blacklist.json
+outputs/symbol_names.json
+outputs/.listdate_cache.json
+outputs/screener_full_a_today.json
+outputs/screener_today.json
+outputs/screener_run.log
+outputs/positions.json
+outputs/daily_picks_log.jsonl
+*.duckdb

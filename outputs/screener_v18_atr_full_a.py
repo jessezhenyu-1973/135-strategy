@@ -1,0 +1,443 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+135战法 V18-ATR — 全A股盘中扫描器 (本地 DuckDB 离线版)
+
+扫描范围: 全市场A股, 硬过滤掉 科创板(688/689) / 北交所(BJ) / ST / 停牌
+输出: 触发V18-ATR买入信号的候选, 按信号强度排序, 取前若干只推荐
+
+数据源: hithink-finance 本地 DuckDB (--source local)
+  默认路径: ~/.local/share/hithink-finance/market.duckdb
+  (无需 API key; 若需最新数据先 `hithink-finance data sync`)
+
+硬过滤规则:
+  1. 科创板: exchange=SH 且 thscode 以 688/689 开头  -> 排除
+  2. 北交所: exchange=BJ                            -> 排除
+  3. ST:     thscode 命中 ST代码黑名单 (ST_BLACKLIST)
+             + 名称含 ST/退 (若本地库 name 非空则追加判断)
+  4. 停牌:   最新K线日期 < 全市场最新交易日            -> 排除(无最新成交)
+
+V18-ATR 信号 (与 config_v18_atr.yaml + stock_screener.py 一致):
+  前置过滤: 非下降趋势 / 收盘>MA55 / MA55五日跌幅<=5%
+  买入① 红杏出墙: MA13连2日向上 + 站上MA13 + 多头排列 + 阳线 + 量>5日均量
+  买入② 一阳穿三线: 单日阳线穿越三线 + 量能>2倍
+  买入③ 揭竿而起: 三线黏合<=1.5% + 5日均黏合<2% + 量能>2倍 + 突破站上三线
+  止损:   ATR(14) 吊灯止损 stop = 近N日最高价 - 2.5×ATR(14)
+
+用法:
+  python3 screener_v18_atr_full_a.py            # 扫描全A, 输出Top5
+  python3 screener_v18_atr_full_a.py --top 8    # 输出Top8
+  python3 screener_v18_atr_full_a.py --json-out /tmp/x.json
+"""
+import os
+import sys
+import json
+import math
+import argparse
+import datetime
+import concurrent.futures as cf
+
+import duckdb
+import pandas as pd
+
+DB_PATH = os.path.expanduser("~/.local/share/hithink-finance/market.duckdb")
+
+# A股ST/退市的常见代码黑名单 (维护说明见文件底部注释)
+# 刷新方法: 配好 API key 后运行 `python3 build_st_blacklist.py`
+#   脚本会远程拉全A名称, 筛含 ST/退, 落盘 st_blacklist.json 供本脚本读取
+#   本地 DuckDB 的 name 字段为空, 故无法靠名称过滤, 必须依赖此名单
+ST_BLACKLIST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'st_blacklist.json')
+SYMBOL_NAMES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'symbol_names.json')
+MARKET_CAP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'market_cap.json')
+
+# 小盘股阈值 (总市值, 亿元): < 此值视为小盘, 排序加权优先
+SMALL_CAP_THRESHOLD = 200.0
+# 次新股排除: 上市 < 此天数 直接剔除 (默认 365 天 = 1年)
+NEW_STOCK_DAYS = 365
+# 并发扫描 worker 数
+CONCURRENCY = 16
+
+
+def load_st_blacklist():
+    bl = {}
+    if os.path.exists(ST_BLACKLIST_FILE):
+        try:
+            with open(ST_BLACKLIST_FILE) as f:
+                extra = json.load(f)
+            if isinstance(extra, list):
+                bl.update({c: 'remote' for c in extra})
+            elif isinstance(extra, dict):
+                bl.update(extra)
+        except Exception:
+            pass
+    return bl
+
+
+ST_BLACKLIST = load_st_blacklist()
+
+
+def load_symbol_names():
+    if os.path.exists(SYMBOL_NAMES_FILE):
+        try:
+            with open(SYMBOL_NAMES_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+SYMBOL_NAMES = load_symbol_names()
+
+
+def load_market_cap():
+    """加载实时市值缓存 {thscode: {price, total_cap, float_cap}} (来自 fetch_market_cap.py)"""
+    if os.path.exists(MARKET_CAP_FILE):
+        try:
+            with open(MARKET_CAP_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+MARKET_CAP = load_market_cap()
+
+
+def get_listing_date(con, thscode):
+    """本地库每只股票最早 K 线日 ≈ 上市日 (库含10年日线)"""
+    d = con.execute("SELECT MIN(date) FROM v_daily WHERE thscode=?", [thscode]).fetchone()[0]
+    return d  # date 对象或 None
+
+# ATR 参数 (来自 config_v18_atr.yaml)
+ATR_PERIOD = 14
+ATR_MULT = 2.5
+
+
+def get_universe(con):
+    """返回候选股票池 (已排除科创板/北交所) 及全市场最新交易日"""
+    latest = con.execute("SELECT MAX(date) FROM v_daily").fetchone()[0]
+    rows = con.execute("""
+        SELECT thscode, exchange, name
+        FROM v_symbol
+        WHERE exchange IN ('SH','SZ','BJ') AND asset_type='a-share'
+    """).fetchall()
+    uni = []
+    for thscode, exch, name in rows:
+        # 排除北交所
+        if exch == 'BJ':
+            continue
+        # 排除科创板 (688/689 开头, 仅沪市)
+        if exch == 'SH' and (thscode.startswith('688') or thscode.startswith('689')):
+            continue
+        uni.append((thscode, name))
+    return uni, latest
+
+
+def is_st(thscode, name):
+    if thscode in ST_BLACKLIST:
+        return True
+    if name and ('ST' in name or '退' in name):
+        return True
+    return False
+
+
+def load_history(con, thscode, bars=120):
+    df = con.execute("""
+        SELECT date, open, high, low, close, volume, amount
+        FROM v_daily
+        WHERE thscode = ?
+        ORDER BY date DESC
+        LIMIT ?
+    """, [thscode, bars]).fetchdf()
+    if df is None or len(df) < 60:
+        return None
+    df = df.sort_values('date').reset_index(drop=True)
+    return df
+
+
+def check_signals(df):
+    """返回 (信号名|None, 详情dict) — 与 stock_screener.check_signals 逻辑一致"""
+    c = df['close']; o = df['open']; v = df['volume']
+    ma13 = c.rolling(13).mean(); ma34 = c.rolling(34).mean(); ma55 = c.rolling(55).mean()
+    vol_ma = v.rolling(5).mean()
+
+    i = len(df) - 1
+    cl, op = c.iloc[i], o.iloc[i]
+    m13, m34, m55 = ma13.iloc[i], ma34.iloc[i], ma55.iloc[i]
+    m13p = ma13.iloc[i - 1]; m13p2 = ma13.iloc[i - 2]
+    vol, vm = v.iloc[i], vol_ma.iloc[i]
+
+    detail = {
+        'close': round(float(cl), 2), 'ma13': round(float(m13), 2),
+        'ma55': round(float(m55), 2),
+        'vol_ratio': round(float(vol / vm), 2) if vm and vm > 0 else 0.0,
+    }
+
+    # 前置过滤: 下降趋势
+    if (m13 < m34 < m55 and m13 < m13p < m13p2 and
+            ma34.iloc[i] < ma34.iloc[i - 1] < ma34.iloc[i - 2] and
+            m55 < ma55.iloc[i - 1] < ma55.iloc[i - 2]):
+        return None, detail
+    if cl < m55:
+        return None, detail
+    m55_5 = ma55.iloc[i - 5]
+    if m55_5 and m55_5 > 0 and (m55_5 - m55) / m55_5 > 0.05:
+        return None, detail
+
+    signals = []
+    # 红杏出墙
+    if (m13p2 <= m13p and m13 > m13p and cl > m13 and cl > op and
+            vol > vm and m13 > m34 > m55):
+        signals.append('红杏出墙')
+    # 一阳穿三线
+    if (cl > op and op < m55 and op < m34 and op < m13 and
+            cl > m55 and cl > m34 and cl > m13 and vol > vm * 2.0):
+        signals.append('一阳穿三线')
+    # 揭竿而起
+    if vm and vm > 0:
+        spread = (max(m13, m34, m55) - min(m13, m34, m55)) / max(m13, m34, m55)
+        avg_spread = 0.0
+        for k in range(5):
+            a13 = m13 if k == 0 else ma13.iloc[i - k]
+            a34 = m34 if k == 0 else ma34.iloc[i - k]
+            a55 = m55 if k == 0 else ma55.iloc[i - k]
+            ms = max(a13, a34, a55); mn = min(a13, a34, a55)
+            avg_spread += (ms - mn) / ms if ms > 0 else 0
+        avg_spread /= 5
+        if (spread < 0.015 and avg_spread < 0.02 and vol > vm * 2.0 and
+                cl > op and cl > m13 and cl > m34 and cl > m55):
+            signals.append('揭竿而起')
+
+    if not signals:
+        return None, detail
+    return '+'.join(signals), detail
+
+
+def atr_stop_level(df, period=ATR_PERIOD, mult=ATR_MULT):
+    h = df['high'].tail(20).max()
+    tr1 = df['high'] - df['low']
+    tr2 = (df['high'] - df['close'].shift()).abs()
+    tr3 = (df['low'] - df['close'].shift()).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.tail(period).mean()
+    if atr and atr > 0:
+        return round(float(h - mult * atr), 2)
+    return None
+
+
+def score_signal(sig_name):
+    """信号强度打分 (用于排序)"""
+    pts = 0
+    if '红杏出墙' in sig_name:
+        pts += 2
+    if '一阳穿三线' in sig_name:
+        pts += 3
+    if '揭竿而起' in sig_name:
+        pts += 2
+    return pts
+
+
+def get_listing_map(con):
+    """批量获取全市场每只股票最早K线日(≈上市日), 一条SQL返回 {thscode: date}"""
+    rows = con.execute(
+        "SELECT thscode, MIN(date) FROM v_daily GROUP BY thscode"
+    ).fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
+def _norm_date_obj(v):
+    """把 'YYYY-MM-DD' 字符串或 date/datetime 归一化为 datetime.date。"""
+    if isinstance(v, datetime.date) and not isinstance(v, datetime.datetime):
+        return v
+    if isinstance(v, datetime.datetime):
+        return v.date()
+    if isinstance(v, str):
+        for fmt in ('%Y-%m-%d', '%Y%m%d'):
+            try:
+                return datetime.datetime.strptime(v[:10], fmt).date()
+            except Exception:
+                continue
+    return None
+
+
+def load_listing_dates_smart(con, latest):
+    """多源冗余上市日: 优先 prefilter_universe (tushare主源 + akshare兜底 + 7天本地缓存),
+    失败/无源/未配置时自动回退本地 DuckDB MIN(date)。
+
+    返回 (map, src):
+      map  : {thscode: datetime.date}  统一为 date 对象
+      src  : 来源描述字符串(用于日志/审计)
+    """
+    src, mmap = 'duckdb', None
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import prefilter_universe as pf
+        raw = pf.load_listing_dates()   # 多源: 7天缓存 > tushare > akshare
+        if raw:
+            norm = {}
+            for k, v in raw.items():
+                d = _norm_date_obj(v)
+                if d:
+                    norm[k] = d
+            if norm:
+                mmap, src = norm, 'multisource(tushare/akshare+缓存)'
+    except Exception as e:
+        print(f"  [warn] 多源上市日加载失败: {e}")
+    if mmap is None:
+        mmap = get_listing_map(con)     # DuckDB MIN(date) 回退
+    return mmap, src
+
+
+def scan_one(args_tuple):
+    """单只股票扫描 worker (线程安全: 各自建 DuckDB 连接).
+
+    返回 dict (命中) 或 None. 已做 ST/次新/停牌 硬过滤.
+    """
+    code, name, db_path, latest, new_stock_cutoff, small_cap_thr, listing_map, main_fund_map = args_tuple
+    # ST 过滤
+    if is_st(code, name):
+        return None
+    # 上市日 -> 次新股排除
+    listing = listing_map.get(code)
+    if listing is not None and listing >= new_stock_cutoff:
+        return None
+    try:
+        con = duckdb.connect(db_path, read_only=True)
+        df = load_history(con, code)
+        con.close()
+    except Exception:
+        return None
+    if df is None:
+        return None
+    # 停牌过滤
+    if df['date'].iloc[-1].date() < latest:
+        return None
+    sig, detail = check_signals(df)
+    if not sig:
+        return None
+    stop = atr_stop_level(df)
+    entry = detail['close']
+    # 市值维度 (腾讯 -> 东财 冗余合并, 见 main)
+    capinfo = MARKET_CAP.get(code)
+    total_cap = capinfo['total_cap'] if capinfo else None
+    is_small = (total_cap is not None and total_cap < small_cap_thr)
+    # 主力资金维度 (东财全市场主力净流入映射, 正加负减; None=无数据)
+    main_fund = main_fund_map.get(code[:6]) if main_fund_map else None
+    return {
+        'code': code,
+        'name': SYMBOL_NAMES.get(code, name or ''),
+        'signal': sig,
+        'score': score_signal(sig),
+        'close': entry, 'ma13': detail['ma13'], 'ma55': detail['ma55'],
+        'vol_ratio': detail['vol_ratio'],
+        'atr_stop': stop,
+        'stop_pct': round((stop / entry - 1) * 100, 2) if stop else None,
+        'date': str(df['date'].iloc[-1]),
+        'total_cap': total_cap,
+        'is_small_cap': is_small,
+        'main_fund': main_fund,
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--top', type=int, default=5)
+    ap.add_argument('--json-out', type=str, default=None)
+    ap.add_argument('--db', type=str, default=DB_PATH)
+    ap.add_argument('--concurrency', type=int, default=CONCURRENCY)
+    ap.add_argument('--small-cap-thr', type=float, default=SMALL_CAP_THRESHOLD)
+    ap.add_argument('--new-stock-days', type=int, default=NEW_STOCK_DAYS)
+    ap.add_argument('--main-fund-top', type=int, default=100,
+                    help='东财主力净流入榜TopN作为排序加分(0=关闭)')
+    args = ap.parse_args()
+
+    con = duckdb.connect(args.db, read_only=True)
+    universe, latest = get_universe(con)
+    # 多源冗余上市日: 优先 tushare/akshare(7天缓存) -> 失败回退本地 DuckDB MIN(date)
+    listing_map, listing_src = load_listing_dates_smart(con, latest)
+    con.close()
+    print(f"[扫描] 全市场最新交易日: {latest}  候选池(剔除科创/北交): {len(universe)} 只")
+    print(f"[上市日源] {listing_src} ({len(listing_map)} 只)")
+    print(f"[过滤] 排除上市<{args.new_stock_days}天次新股; 小盘阈值=总市值<{args.small_cap_thr}亿; 并发={args.concurrency}")
+
+    new_stock_cutoff = latest - datetime.timedelta(days=args.new_stock_days)
+
+    # ---- 市值多源冗余: 主源=腾讯(fetch_market_cap已落盘 MARKET_CAP) -> 回退东财批量 ----
+    all_codes = [c for c, _ in universe]
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import eastmoney_source as em
+        merged = em.load_market_caps_redundant(all_codes, MARKET_CAP)
+        # 把合并结果写回全局 MARKET_CAP, scan_one 直接读
+        MARKET_CAP.clear()
+        MARKET_CAP.update(merged)
+        em_cnt = sum(1 for v in merged.values() if v.get('total_cap'))
+        print(f"[市值源] 腾讯+东财冗余合并完成: {em_cnt} 只有市值")
+    except Exception as e:
+        print(f"  [warn] 东财市值冗余失败(仅用腾讯): {e}")
+
+    # ---- 主力资金维度: 东财全市场主力净流入映射 {code: 净流入亿元} (正加负减, 不否决信号) ----
+    main_fund_map = {}
+    if args.main_fund_top > 0:
+        try:
+            import eastmoney_source as em
+            main_fund_map = em.main_fund_map_full(market='all')
+            print(f"[资金流] 东财全市场主力净流入映射: {len(main_fund_map)} 只 (正加负减)")
+        except Exception as e:
+            print(f"  [warn] 主力资金榜加载失败(跳过加权): {e}")
+
+    tasks = [(code, name, args.db, latest, new_stock_cutoff, args.small_cap_thr,
+              listing_map, main_fund_map) for code, name in universe]
+
+    hits = []
+    scanned = 0
+    done = 0
+    with cf.ThreadPoolExecutor(max_workers=args.concurrency) as ex:
+        futs = {ex.submit(scan_one, t): t for t in tasks}
+        for fut in cf.as_completed(futs):
+            r = fut.result()
+            done += 1
+            if r is not None:
+                hits.append(r)
+            if done % 1000 == 0 or done == len(tasks):
+                print(f"  ...已扫描 {done}/{len(tasks)}, 命中 {len(hits)}")
+
+    # 排序: 小盘加权优先 -> 主力资金连续加权(正加负减, 封顶±20亿) -> 信号强度 -> 量比
+    # main_fund: None=无数据(中性0); 数值=东财主力净流入(亿元, 可正可负)
+    def _fund_w(h):
+        mf = h.get('main_fund')
+        if mf is None:
+            return 0.0
+        return -min(max(mf, -20.0), 20.0)  # 负权重=净流入为正时排前; 封顶避免极端值主导
+    hits.sort(key=lambda x: (not x['is_small_cap'], _fund_w(x),
+                             -x['score'], -x['vol_ratio']))
+    top = hits[:args.top]
+
+    print(f"\n{'='*64}")
+    small_cnt = sum(1 for h in hits if h['is_small_cap'])
+    mf_pos = sum(1 for h in hits if (h.get('main_fund') or 0) > 0)
+    mf_neg = sum(1 for h in hits if (h.get('main_fund') or 0) < 0)
+    print(f"触发 V18-ATR 信号: 共 {len(hits)} 只 (小盘<{args.small_cap_thr}亿 {small_cnt} 只, "
+          f"主力净流入+ {mf_pos} / - {mf_neg} 只), 推荐 Top{args.top}:")
+    for i, h in enumerate(top, 1):
+        tag = " [小盘]" if h['is_small_cap'] else ""
+        mf = h.get('main_fund')
+        if mf is not None:
+            tag += f" [主力{'+' if mf >= 0 else ''}{mf:.1f}亿]"
+        capstr = f"总市值{h['total_cap']}亿" if h['total_cap'] is not None else "总市值N/A"
+        print(f"{i}. {h['code']} {h['name']}{tag} | {h['signal']} | "
+              f"收盘{h['close']} 量比{h['vol_ratio']}x | {capstr} | "
+              f"ATR止损{h['atr_stop']} ({h['stop_pct']}%)")
+    out = args.json_out or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), 'screener_full_a_today.json')
+    with open(out, 'w') as f:
+        json.dump({'date': str(latest), 'scanned': len(tasks),
+                   'total_hits': len(hits), 'small_cap_hits': small_cnt,
+                   'main_fund_pos': mf_pos, 'main_fund_neg': mf_neg,
+                   'top': top}, f,
+                  ensure_ascii=False, indent=2)
+    print(f"\n结果已保存: {out}")
+
+
+if __name__ == '__main__':
+    main()
