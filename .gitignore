@@ -8,5 +8,6 @@ build/
 .eggs/
 *.csv.bak
 outputs/.listdate_cache.json
+outputs/.prefilter_cache.json
 outputs/screener_today.json
 

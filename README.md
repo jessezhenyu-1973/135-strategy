@@ -77,28 +77,33 @@ python outputs/stock_screener.py --watch 601728.SH,600809.SH
 **改动**：`outputs/stock_screener.py` 新增**拉 K 线前的批量预筛** + **并发扫描**。
 
 #### 1. 预筛模块 `outputs/prefilter_universe.py`（新增）
-在拉 K 线之前，先用批量数据源砍掉不符合条件的股票，缩小扫描池：
+在拉 K 线之前，先用批量数据源砍掉不符合条件的股票，缩小扫描池。采用**三源冗余 + 多数决裁决**架构：
 
-| 过滤项 | 规则 | 数据源（均为实测稳定可用） |
+| 过滤项 | 规则 | 数据源（多源冗余，主源失败自动回退） |
 |---|---|---|
-| 次新股 | 上市日期 < `MIN_LISTED_YEARS` 年（默认 **1 年**）则跳过 | **主源 tushare `stock_basic`**（一次全市场，`ts_code` 即 thscode 格式）→ 兜底 akshare `stock_info_sh/sz_name_code`（沪/深交易所官方信息表，100% 可用） |
-| 大市值 | 总市值 ≥ `MAX_MARKET_CAP_YI` 亿元（默认 **200 亿**）则跳过 | 腾讯行情 `qt.gtimg.cn` 批量接口（字段 `[45]`=总市值/亿元） |
+| 次新股 | 上市日期 < `MIN_LISTED_YEARS` 年（默认 **1 年**）则跳过 | **东财 push2delay**【主/缓存】→ tushare `stock_basic`【兜底】→ akshare 沪/深信息表【兜底】 |
+| 大市值 | 总市值 ≥ `MAX_MARKET_CAP_YI` 亿元（默认 **200 亿**）则跳过 | **东财 push2delay**【主/缓存】→ 腾讯行情 `qt.gtimg.cn`【兜底】 |
 
-> **数据源选型与限频处理**：
-> - tushare 已接入（token 存 `~/.tushare_token`，chmod 600，**不进脚本/对话明文**）。但免费版 `stock_basic` 限频 **1 次/小时**、`daily_basic` 限频且需积分，不适合每日热路径批量拉取。
-> - 故上市日期采用**本地缓存层**（`outputs/.listdate_cache.json`，有效期 `LISTDATE_CACHE_DAYS=7` 天）：缓存有效时直接读；过期才调 tushare 刷新（每日 1 次远低于限频）；tushare 限频/失败时回退 akshare 并写缓存。缓存使 tushare 既"增加数据源"又绝不撞限频。
-> - 市值走腾讯行情（每日变、无限频），未接 tushare `daily_basic`（限频严重）。
-> - 东方财富 `push2.eastmoney.com` 在本环境被频繁重置、akshare 直连也被墙，已弃用。
-> - 拿不到市值的股票按保守策略**保留**（不误杀）。
+**裁决规则（多源冗余核心）**：
+- 次新：**3 源中 ≥2 源判定为次新才跳过**（多数决）；某源缺失按"非次新"计
+- 大市值：**2 源中任一源判大市值即跳过**（仅2源，保守）
+- 拿不到任何市值/上市日 → **保守保留**（不误杀）
+
+**数据源与缓存**：
+- **东方财富 `push2delay.eastmoney.com`**（延时~15min，对市值/上市日预筛无影响）为主源，一次分页拉全市场（含 `f20` 总市值/`f26` 上市日），结果落本地缓存 `.prefilter_cache.json`（有效期 `CACHE_DAYS=7` 天），过期才重拉。
+- tushare 已接入（token 存 `~/.tushare_token`，chmod 600，**不进明文**），免费版 `stock_basic` 限频 1次/小时，作上市日兜底；`daily_basic` 限频严重，**市值不接 tushare**。
+- 腾讯行情批量（GBK 解码）作市值兜底。原 `push2.eastmoney.com`（非 delay 域）在本环境被频繁重置，故改走 `push2delay` 域。
+- 东财主源走本机代理 `socks5h://127.0.0.1:10808`（v2rayN/xray 监听，直连东财偶发 TLS 重置）。
 
 **可调参数**（在 `prefilter_universe.py` 顶部）：
 ```python
 MAX_MARKET_CAP_YI = 200.0   # 总市值上限(亿元)，仅扫描 < 此值的股票
 MIN_LISTED_YEARS = 1.0      # 次新股判定：上市未满 N 年视为次新，跳过
-LISTDATE_CACHE_DAYS = 7      # 上市日期本地缓存有效期(天)，到期用 tushare 刷新
+CACHE_DAYS = 7              # 东财主源缓存有效期(天)，到期重拉
+PROXY = "socks5h://127.0.0.1:10808"   # 本机 v2rayN 代理
 ```
 
-**实测**：预筛后扫描池 ~4400 → **3707 只**（跳过次新 39 / 大市值 849）。
+**实测**：三源冗余预筛后候选池约 **4027 只**（跳过次新 39 / 大市值 866），随后 8 线程并发扫描。
 
 #### 2. 并发扫描（`stock_screener.py` 改造）
 扫描循环从串行改为 `ThreadPoolExecutor` 并发拉 K 线。`check_signals` / 停牌过滤 / ATR 止损逻辑**完全未动**，仅调度方式变化。
@@ -237,9 +242,11 @@ python outputs/stock_screener.py --workers 16    # 手动调并发数
   - 联合验证: 3年+21.0%/回撤12.9%, 收益回撤比1.63（vs V17退出的0.14）
   - 新增实盘选股器 `stock_screener.py` + 通达信公式V2 + 配置固化 `config_v18_atr.yaml`
 - **实盘选股器提速改造** (2026-08-28):
-  - 新增 `outputs/prefilter_universe.py`：拉 K 线前批量预筛（次新<1年跳过、总市值≥200亿跳过），扫描池 ~4400 → 3707 只
-  - 数据源：上市日【主 tushare `stock_basic` + 兜底 akshare 沪/深信息表】+ 市值【腾讯行情批量】；弃用被墙的东方财富 push2 / akshare 直连
-  - **tushare 接入**：token 存 `~/.tushare_token`（chmod 600，不进明文）；因免费版限频（stock_basic 1次/小时、daily_basic 需积分），上市日加本地缓存层（`.listdate_cache.json`，7天有效），缓存优先→过期才调 tushare→失败回退 akshare，既用上 tushare 又绝不撞限频
+  - 新增 `outputs/prefilter_universe.py`：拉 K 线前批量预筛（次新<1年跳过、总市值≥200亿跳过）
+  - 数据源**三源冗余 + 多数决裁决**：上市日【东财push2delay主/缓存 → tushare → akshare】+ 市值【东财push2delay主/缓存 → 腾讯行情】；mcp-eastmoney 仓库暴露的 `push2delay.eastmoney.com` 域在本环境稳定（原 `push2` 被重置），一次分页拉全市场含 f20市值/f26上市日
+  - 裁决：次新需3源中≥2源判定、大市值2源任一判定即跳过、缺失保守保留；东财结果落 `.prefilter_cache.json`（7天有效），兜底源实时查
+  - **tushare 接入**：token 存 `~/.tushare_token`（chmod 600，不进明文）；免费版 stock_basic 限频1次/小时作上市日兜底，daily_basic 限频严重故市值不接 tushare
+  - 东财主源走本机代理 `socks5h://127.0.0.1:10808`（v2rayN/xray），直连偶发 TLS 重置
   - `stock_screener.py` 扫描循环改为 8 线程并发（`ThreadPoolExecutor`），全池扫描 39min → **4m43s**
   - 详见上方「实盘选股器：市值/次新预筛 + 并发提速」章节
 - **v17-final + Portfolio v1** (2026-08-24): 研究中期
