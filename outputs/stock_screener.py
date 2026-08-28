@@ -14,9 +14,12 @@ import json
 import subprocess
 import argparse
 import datetime
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from run_param_sensitivity import get_hs300_codes, get_stock_history
+from prefilter_universe import prefilter_universe
 
 def get_all_mainboard_codes():
     """全市场沪深A股(主板+创业板): 排除北交所、科创板(688)、ST/退市股"""
@@ -116,6 +119,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--pool', choices=['hs300', 'all'], default='all')
     parser.add_argument('--watch', type=str, help='逗号分隔的持仓代码, 输出ATR止损位')
+    parser.add_argument('--no-prefilter', action='store_true',
+                        help='跳过市值/次新预筛, 扫描全部主板+创业板(慢, 兜底用)')
+    parser.add_argument('--workers', type=int, default=8,
+                        help='并发拉取K线的线程数(默认8)')
     args = parser.parse_args()
 
     if args.watch:
@@ -132,37 +139,57 @@ def main():
         return
 
     if args.pool == 'all':
-        print("获取全市场沪深A股(主板+创业板, 排除北交所/科创板/ST)...")
-        codes = get_all_mainboard_codes()
+        if args.no_prefilter:
+            print("获取全市场沪深A股(主板+创业板, 排除北交所/科创板/ST)...")
+            codes = get_all_mainboard_codes()
+        else:
+            print("预筛: 排除次新股(上市<1年)与总市值>=200亿的股票...")
+            codes = prefilter_universe()
+            print(f"预筛后候选 {len(codes)} 只")
     else:
         print("获取沪深300成分股...")
         codes = get_hs300_codes(300)
-    print(f"共{len(codes)}只, 开始扫描...\n")
+    print(f"共{len(codes)}只, 开始扫描(并发{args.workers})...\n")
 
-    hits = []
     today = datetime.datetime.now().strftime('%Y%m%d')
-    for i, code in enumerate(codes):
+    hits = []
+    total = len(codes)
+    done = 0
+    lock = threading.Lock()
+
+    def worker(code):
+        nonlocal done
         df = get_stock_history(code, start_date='20230101', end_date=today)
         if df is None:
-            continue
+            return None
         # 排除停牌股: 最新5根K线内有0成交量或最新日期距今超过7天视为停牌/无数据
         last_date = df.index[-1]
         if isinstance(last_date, tuple):
-            continue
+            return None
         days_since = (datetime.datetime.now() - last_date.to_pydatetime()).days
         if days_since > 7:
-            continue
+            return None
         if (df['volume'].tail(5) == 0).any():
-            continue
+            return None
         sig, detail = check_signals(df)
         if sig:
             stop = atr_stop_level(df)
-            hits.append({'code': code, 'signal': sig, **detail,
-                         'atr_stop': stop, 'date': str(df.index[-1].date())})
-            print(f"★ {code} [{sig}] 收盘{detail['close']} "
-                  f"量比{detail['vol_ratio']}x ATR止损位{stop}")
-        if (i + 1) % 50 == 0:
-            print(f"  ...已扫描{i+1}/{len(codes)}")
+            return {'code': code, 'signal': sig, **detail,
+                    'atr_stop': stop, 'date': str(df.index[-1].date())}
+        return None
+
+    with ThreadPoolExecutor(max_workers=args.workers) as ex:
+        futures = {ex.submit(worker, c): c for c in codes}
+        for fut in as_completed(futures):
+            r = fut.result()
+            if r:
+                with lock:
+                    hits.append(r)
+                    print(f"★ {r['code']} [{r['signal']}] 收盘{r['close']} "
+                          f"量比{r['vol_ratio']}x ATR止损位{r['atr_stop']}")
+            done += 1
+            if done % 100 == 0:
+                print(f"  ...已扫描{done}/{total} (命中{len(hits)})")
 
     print(f"\n{'='*60}")
     print(f"今日触发信号: {len(hits)} 只")
