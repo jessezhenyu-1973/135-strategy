@@ -262,8 +262,15 @@ python outputs/stock_screener.py --workers 16    # 手动调并发数
 
 - **实盘主分支**：`feat/v18-atr-final` 为实盘主仓库（含 V18 选股/止损公式 + 预筛/并发/tushare 全部改动）；`main` 与之对齐。研究阶段已结束，后续改动均在此分支进行。V18 的**选股公式**(`outputs/135_v18_atr_tdx_formula.txt`)、**止损主图公式**(`outputs/135_v18_atr_tdx_stopline.txt`)、**配置固化**(`config_v18_atr.yaml`) 是每日 14:30 选股任务的基础，合并/重构时务必先 diff 这三个文件。
 - **GitHub 网络**：本机命令行直连 github.com 会被 GnuTLS TLS 重置。已在本机运行 v2rayN(xray)，监听 `127.0.0.1:10808`。需先配置 `git config --global http.proxy socks5h://127.0.0.1:10808`（socks5h 的 h 表示代理做 DNS 解析，避免本地 DNS 污染），之后 fetch/push 正常。注意：用户说"开了代理"往往指本机 GUI 代理，命令行工具需显式配置；先用 `ss -tlnp` 找 xray/v2ray 实际监听端口。
-- **数据源接入约定**：预筛模块 `outputs/prefilter_universe.py` 多源冗余 —— 上市日【主 tushare → 兜底 akshare】+ 市值【腾讯行情批量】。token/密钥一律存 `~/.tushare_token`(chmod 600) 等家目录受保护文件，**绝不进脚本/对话明文/仓库**。新数据源接入时遵循：① 敏感信息走环境变量或 ~/. 文件 ② 限频源(tushare 免费版 stock_basic 1次/小时)必须加本地缓存层(`.listdate_cache.json`, 7天有效)避免热路径撞限频 ③ 主源失败自动回退兜底源。
-- **运行产物不入库**：`.listdate_cache.json`、`screener_today.json` 已加 `.gitignore`（派生数据，会随时间变），提交时勿 `git add -A` 误带。
+- **数据源接入约定**：
+  - **实时 K 线/信号主源**：同花顺 `hithink-finance`（`get_stock_history` 拉 K 线、判 135 战法信号、算 ATR 止损）。
+  - **预筛模块 `outputs/prefilter_universe.py` 多源冗余**：
+    - 上市日期【主 东财 `push2delay`(缓存) → 兜底 tushare `stock_basic` → 兜底 akshare 沪/深信息表】
+    - 总市值【主 东财 `push2delay`(缓存) → 兜底 腾讯行情 `qt.gtimg.cn`】
+    - 注：tushare 因 `daily_basic` 限频严重，**只兜底上市日期、不碰市值**。
+  - token/密钥一律存 `~/.tushare_token`(chmod 600) 等家目录受保护文件，**绝不进脚本/对话明文/仓库**。
+  - 新数据源接入时遵循：① 敏感信息走环境变量或 ~/. 文件 ② 限频源(tushare 免费版 stock_basic 1次/小时)必须加本地缓存层(`.prefilter_cache.json`, 7天有效)避免热路径撞限频 ③ 主源失败自动回退兜底源。
+- **运行产物不入库**：`.prefilter_cache.json`、`screener_today.json` 已加 `.gitignore`（派生数据，会随时间变），提交时勿 `git add -A` 误带。
 
 ## 下一步
 
