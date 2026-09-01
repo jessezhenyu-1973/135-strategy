@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-135战法 V18-ATR — 全A股盘中扫描器 (本地 DuckDB 离线版)
+"""135战法 V18-ATR - 全A股盘中扫描器 (本地 DuckDB 离线版 + 腾讯实时快照校准)
 
 扫描范围: 全市场A股, 硬过滤掉 科创板(688/689) / 北交所(BJ) / ST / 停牌
 输出: 触发V18-ATR买入信号的候选, 按信号强度排序, 取前若干只推荐
 
-数据源: hithink-finance 本地 DuckDB (--source local)
-  默认路径: ~/.local/share/hithink-finance/market.duckdb
-  (无需 API key; 若需最新数据先 `hithink-finance data sync`)
+数据源:
+  - 日K骨架: hithink-finance 本地 DuckDB (--source local)
+    默认路径: ~/.local/share/hithink-finance/market.duckdb
+    (无需 API key; 若需最新数据先 `hithink-finance data sync`)
+  - 盘中实时校准: 腾讯 qt.gtimg.cn 实时快照 (--realtime)
+    仅覆盖最后一根 bar 的 OHLCV, 让均线/ATR 基于当天盘中最新价重新计算
 
 硬过滤规则:
   1. 科创板: exchange=SH 且 thscode 以 688/689 开头  -> 排除
@@ -28,6 +30,7 @@ V18-ATR 信号 (与 config_v18_atr.yaml + stock_screener.py 一致):
   python3 screener_v18_atr_full_a.py            # 扫描全A, 输出Top5
   python3 screener_v18_atr_full_a.py --top 8    # 输出Top8
   python3 screener_v18_atr_full_a.py --json-out /tmp/x.json
+  python3 screener_v18_atr_full_a.py --realtime # 盘中模式: 腾讯快照校准最后一根bar
 """
 import os
 import sys
@@ -102,6 +105,62 @@ def load_market_cap():
 
 
 MARKET_CAP = load_market_cap()
+
+
+def fetch_realtime_snapshot(thscodes):
+    """从腾讯 qt.gtimg.cn 抓取实时快照, 返回 {thscode: {open, high, low, close, volume}}.
+    失败/超时返回空 dict, 不影响离线扫描.
+    """
+    try:
+        import httpx
+    except Exception:
+        return {}
+    qcodes = []
+    mapping = {}
+    for thscode in thscodes:
+        try:
+            ticker, exch = thscode.split('.')
+        except ValueError:
+            continue
+        qcode = f"{exch.lower()}{ticker}"
+        qcodes.append(qcode)
+        mapping[qcode] = thscode
+    if not qcodes:
+        return {}
+    result = {}
+    for i in range(0, len(qcodes), 100):
+        batch = qcodes[i:i + 100]
+        url = "https://qt.gtimg.cn/q=" + ",".join(batch)
+        try:
+            r = httpx.get(url, timeout=10)
+            r.encoding = "gbk"
+            text = r.text
+        except Exception:
+            continue
+        for line in text.split("\n"):
+            line = line.strip()
+            if not line.startswith("v_"):
+                continue
+            try:
+                eq = line.index('="') + 2
+                qcode = line[2:eq - 2]
+                payload = line[eq:line.rindex('"')]
+                f = payload.split("~")
+                if len(f) < 35:
+                    continue
+                thscode = mapping.get(qcode)
+                if not thscode:
+                    continue
+                result[thscode] = {
+                    "open": float(f[5]) if f[5] else 0.0,
+                    "high": float(f[33]) if f[33] else 0.0,
+                    "low": float(f[34]) if f[34] else 0.0,
+                    "close": float(f[3]) if f[3] else 0.0,
+                    "volume": float(f[6]) if f[6] else 0.0,
+                }
+            except Exception:
+                continue
+    return result
 
 
 def get_listing_date(con, thscode):
@@ -181,7 +240,7 @@ def load_history_mem(memdict, thscode, bars=120):
 
 
 def check_signals(df):
-    """返回 (信号名|None, 详情dict) — 与 stock_screener.check_signals 逻辑一致"""
+    """返回 (信号名|None, 详情dict) - 与 stock_screener.check_signals 逻辑一致"""
     c = df['close']; o = df['open']; v = df['volume']
     ma13 = c.rolling(13).mean(); ma34 = c.rolling(34).mean(); ma55 = c.rolling(55).mean()
     vol_ma = v.rolling(5).mean()
@@ -317,8 +376,9 @@ def scan_one(args_tuple):
     """单只股票扫描 worker (内存模式: 从 alldf 切片, 零 DuckDB IO).
 
     返回 dict (命中) 或 None. 已做 ST/次新/停牌 硬过滤.
+    支持可选 realtime 覆盖最后一根 bar 的 OHLCV, 用于盘中实时校准.
     """
-    code, name, alldf, latest, new_stock_cutoff, small_cap_thr, listing_map, main_fund_map = args_tuple
+    code, name, alldf, latest, new_stock_cutoff, small_cap_thr, listing_map, main_fund_map, realtime = args_tuple
     # ST 过滤
     if is_st(code, name):
         return None
@@ -335,6 +395,18 @@ def scan_one(args_tuple):
     # 停牌过滤
     if df['date'].iloc[-1].date() < latest:
         return None
+    # 实时快照覆盖最后一根 bar (盘中校准) - 仅更新 OHLC, 保留历史成交量用于量比计算
+    rt_applied = False
+    if realtime and code in realtime:
+        rt = realtime[code]
+        if rt.get('close') is not None and rt.get('close') > 0:
+            df = df.copy()
+            idx = df.index[-1]
+            for k in ['open', 'high', 'low', 'close']:
+                v = rt.get(k)
+                if v is not None and isinstance(v, (int, float)):
+                    df.loc[idx, k] = v
+            rt_applied = True
     sig, detail = check_signals(df)
     if not sig:
         return None
@@ -359,6 +431,7 @@ def scan_one(args_tuple):
         'total_cap': total_cap,
         'is_small_cap': is_small,
         'main_fund': main_fund,
+        'realtime': rt_applied,
     }
 
 
@@ -372,16 +445,18 @@ def main():
     ap.add_argument('--new-stock-days', type=int, default=NEW_STOCK_DAYS)
     ap.add_argument('--main-fund-top', type=int, default=100,
                     help='东财主力净流入榜TopN作为排序加分(0=关闭)')
+    ap.add_argument('--realtime', action='store_true', default=False,
+                    help='盘中模式: 用腾讯实时快照校准最后一根bar的OHLCV')
     args = ap.parse_args()
 
     con = duckdb.connect(args.db, read_only=True)
     universe, latest = get_universe(con)
     # 多源冗余上市日: 优先 tushare/akshare(7天缓存) -> 失败回退本地 DuckDB MIN(date)
     listing_map, listing_src = load_listing_dates_smart(con, latest)
-    # 一次性把全市场近220天日K读进内存(单连接, ~0.5s), 之后扫描零DuckDB IO
+    # 一次性把全市场近220天日K读进内存(单连接, ~0.5s), 之后扫描零 DuckDB IO
     t_load = time.time()
     alldf, _ = load_all_history(con, days=220)
-    # 预建 {thscode: subdf} 分组字典(O(1) 取数, 避免逐股布尔索引全表扫描)
+    # 预建 {thscode: subdf} 分组字典(O(1)取数, 避免逐股布尔索引全表扫描)
     memdict = {k: v for k, v in alldf.groupby('thscode', sort=False)}
     con.close()
     load_secs = time.time() - t_load
@@ -391,6 +466,15 @@ def main():
     print(f"[过滤] 排除上市<{args.new_stock_days}天次新股; 小盘阈值=总市值<{args.small_cap_thr}亿; 并发={args.concurrency}")
 
     new_stock_cutoff = latest - datetime.timedelta(days=args.new_stock_days)
+
+    # ---- 实时快照校准 (仅最后一根bar) ----
+    realtime_map = {}
+    if args.realtime:
+        print("[实时] 正在拉取腾讯实时快照...")
+        all_codes = [c for c, _ in universe]
+        t0 = time.time()
+        realtime_map = fetch_realtime_snapshot(all_codes)
+        print(f"[实时] 腾讯快照返回 {len(realtime_map)} 只, 耗时{time.time()-t0:.1f}s")
 
     # ---- 市值多源冗余: 主源=腾讯(fetch_market_cap已落盘 MARKET_CAP) -> 回退东财批量 ----
     all_codes = [c for c, _ in universe]
@@ -417,7 +501,7 @@ def main():
             print(f"  [warn] 主力资金榜加载失败(跳过加权): {e}")
 
     tasks = [(code, name, memdict, latest, new_stock_cutoff, args.small_cap_thr,
-              listing_map, main_fund_map) for code, name in universe]
+              listing_map, main_fund_map, realtime_map) for code, name in universe]
 
     hits = []
     scanned = 0
@@ -445,15 +529,18 @@ def main():
 
     print(f"\n{'='*64}")
     small_cnt = sum(1 for h in hits if h['is_small_cap'])
+    rt_cnt = sum(1 for h in hits if h.get('realtime'))
     mf_pos = sum(1 for h in hits if (h.get('main_fund') or 0) > 0)
     mf_neg = sum(1 for h in hits if (h.get('main_fund') or 0) < 0)
     print(f"触发 V18-ATR 信号: 共 {len(hits)} 只 (小盘<{args.small_cap_thr}亿 {small_cnt} 只, "
-          f"主力净流入+ {mf_pos} / - {mf_neg} 只), 推荐 Top{args.top}:")
+          f"主力净流入+ {mf_pos} / - {mf_neg} 只, 实时校准 {rt_cnt} 只), 推荐 Top{args.top}:")
     for i, h in enumerate(top, 1):
         tag = " [小盘]" if h['is_small_cap'] else ""
         mf = h.get('main_fund')
         if mf is not None:
             tag += f" [主力{'+' if mf >= 0 else ''}{mf:.1f}亿]"
+        if h.get('realtime'):
+            tag += " [实时]"
         capstr = f"总市值{h['total_cap']}亿" if h['total_cap'] is not None else "总市值N/A"
         print(f"{i}. {h['code']} {h['name']}{tag} | {h['signal']} | "
               f"收盘{h['close']} 量比{h['vol_ratio']}x | {capstr} | "
@@ -464,8 +551,8 @@ def main():
         json.dump({'date': str(latest), 'scanned': len(tasks),
                    'total_hits': len(hits), 'small_cap_hits': small_cnt,
                    'main_fund_pos': mf_pos, 'main_fund_neg': mf_neg,
-                   'top': top}, f,
-                  ensure_ascii=False, indent=2)
+                   'realtime_hits': rt_cnt, 'top': top}, f,
+                 ensure_ascii=False, indent=2)
     print(f"\n结果已保存: {out}")
 
 
