@@ -397,6 +397,8 @@ def scan_one(args_tuple):
         return None
     # 实时快照覆盖最后一根 bar (盘中校准) - 仅更新 OHLC, 保留历史成交量用于量比计算
     rt_applied = False
+    is_limit_up = False
+    limit_up_pct = None
     if realtime and code in realtime:
         rt = realtime[code]
         if rt.get('close') is not None and rt.get('close') > 0:
@@ -407,6 +409,12 @@ def scan_one(args_tuple):
                 if v is not None and isinstance(v, (int, float)):
                     df.loc[idx, k] = v
             rt_applied = True
+            # 涨停判断: 用实时涨跌幅判断, ST 股 4.5%/普通股 9.5% 以上视为涨停
+            change_pct = rt.get('change_pct')
+            if change_pct is not None:
+                is_stock = is_st(code, name)
+                limit_up_pct = 4.5 if is_stock else 9.5
+                is_limit_up = change_pct >= limit_up_pct
     sig, detail = check_signals(df)
     if not sig:
         return None
@@ -517,43 +525,59 @@ def main():
                 print(f"  ...已扫描 {done}/{len(tasks)}, 命中 {len(hits)}")
 
     # 排序: 小盘加权优先 -> 主力资金连续加权(正加负减, 封顶±20亿) -> 信号强度 -> 量比
-    # main_fund: None=无数据(中性0); 数值=东财主力净流入(亿元, 可正可负)
-    def _fund_w(h):
-        mf = h.get('main_fund')
-        if mf is None:
-            return 0.0
-        return -min(max(mf, -20.0), 20.0)  # 负权重=净流入为正时排前; 封顶避免极端值主导
-    hits.sort(key=lambda x: (not x['is_small_cap'], _fund_w(x),
-                             -x['score'], -x['vol_ratio']))
-    top = hits[:args.top]
+        def _fund_w(h):
+            mf = h.get('main_fund')
+            if mf is None:
+                return 0.0
+            return -min(max(mf, -20.0), 20.0)
 
-    print(f"\n{'='*64}")
-    small_cnt = sum(1 for h in hits if h['is_small_cap'])
-    rt_cnt = sum(1 for h in hits if h.get('realtime'))
-    mf_pos = sum(1 for h in hits if (h.get('main_fund') or 0) > 0)
-    mf_neg = sum(1 for h in hits if (h.get('main_fund') or 0) < 0)
-    print(f"触发 V18-ATR 信号: 共 {len(hits)} 只 (小盘<{args.small_cap_thr}亿 {small_cnt} 只, "
-          f"主力净流入+ {mf_pos} / - {mf_neg} 只, 实时校准 {rt_cnt} 只), 推荐 Top{args.top}:")
-    for i, h in enumerate(top, 1):
-        tag = " [小盘]" if h['is_small_cap'] else ""
-        mf = h.get('main_fund')
-        if mf is not None:
-            tag += f" [主力{'+' if mf >= 0 else ''}{mf:.1f}亿]"
-        if h.get('realtime'):
-            tag += " [实时]"
-        capstr = f"总市值{h['total_cap']}亿" if h['total_cap'] is not None else "总市值N/A"
-        print(f"{i}. {h['code']} {h['name']}{tag} | {h['signal']} | "
-              f"收盘{h['close']} 量比{h['vol_ratio']}x | {capstr} | "
-              f"ATR止损{h['atr_stop']} ({h['stop_pct']}%)")
-    out = args.json_out or os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), 'screener_full_a_today.json')
-    with open(out, 'w') as f:
-        json.dump({'date': str(latest), 'scanned': len(tasks),
-                   'total_hits': len(hits), 'small_cap_hits': small_cnt,
-                   'main_fund_pos': mf_pos, 'main_fund_neg': mf_neg,
-                   'realtime_hits': rt_cnt, 'top': top}, f,
-                 ensure_ascii=False, indent=2)
-    print(f"\n结果已保存: {out}")
+        hits.sort(key=lambda x: (not x['is_small_cap'], _fund_w(x),
+                                 -x['score'], -x['vol_ratio']))
+        top = hits[:args.top]
+
+        buyable = [h for h in hits if not h.get('limit_up')]
+        limit_up_list = [h for h in hits if h.get('limit_up')]
+        buyable_top = buyable[:args.top]
+
+        print(f"\n{'='*64}")
+        small_cnt = sum(1 for h in hits if h['is_small_cap'])
+        rt_cnt = sum(1 for h in hits if h.get('realtime'))
+        mf_pos = sum(1 for h in hits if (h.get('main_fund') or 0) > 0)
+        mf_neg = sum(1 for h in hits if (h.get('main_fund') or 0) < 0)
+        print(f"触发 V18-ATR 信号: 共 {len(hits)} 只 (小盘<{args.small_cap_thr}亿 {small_cnt} 只, "
+              f"主力净流入+ {mf_pos} / - {mf_neg} 只, 实时校准 {rt_cnt} 只)")
+        print(f"涨停不可买入 {len(limit_up_list)} 只 | 可买入 {len(buyable)} 只 | 推荐 Top{args.top}:\n")
+
+        print("【涨停 / 不可买入】")
+        for i, h in enumerate(limit_up_list[:args.top], 1):
+            capstr = f"总市值{h['total_cap']}亿" if h['total_cap'] is not None else "总市值N/A"
+            print(f"{i}. {h['code']} {h['name']} | {h['signal']} | "
+                  f"收盘{h['close']} 量比{h['vol_ratio']}x | {capstr} | "
+                  f"ATR止损{h['atr_stop']} ({h['stop_pct']}%) | 涨停")
+
+        print("\n【未涨停 / 可买入】")
+        for i, h in enumerate(buyable_top, 1):
+            tag = " [小盘]" if h['is_small_cap'] else ""
+            mf = h.get('main_fund')
+            if mf is not None:
+                tag += f" [主力{'+' if mf >= 0 else ''}{mf:.1f}亿]"
+            if h.get('realtime'):
+                tag += " [实时]"
+            capstr = f"总市值{h['total_cap']}亿" if h['total_cap'] is not None else "总市值N/A"
+            print(f"{i}. {h['code']} {h['name']}{tag} | {h['signal']} | "
+                  f"收盘{h['close']} 量比{h['vol_ratio']}x | {capstr} | "
+                  f"ATR止损{h['atr_stop']} ({h['stop_pct']}%)")
+        out = args.json_out or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), 'screener_full_a_today.json')
+        with open(out, 'w') as f:
+            json.dump({'date': str(latest), 'scanned': len(tasks),
+                       'total_hits': len(hits), 'small_cap_hits': small_cnt,
+                       'main_fund_pos': mf_pos, 'main_fund_neg': mf_neg,
+                       'realtime_hits': rt_cnt, 'limit_up_count': len(limit_up_list),
+                       'buyable_count': len(buyable), 'top': buyable_top,
+                       'limit_up': limit_up_list}, f,
+                     ensure_ascii=False, indent=2)
+        print(f"\n结果已保存: {out}")
 
 
 if __name__ == '__main__':
