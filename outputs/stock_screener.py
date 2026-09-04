@@ -18,7 +18,8 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from run_param_sensitivity import get_hs300_codes, get_stock_history
+from run_param_sensitivity import (get_hs300_codes, get_stock_history,
+                                  get_stock_history_with_today)
 from prefilter_universe import prefilter_universe
 
 def get_all_mainboard_codes():
@@ -30,7 +31,13 @@ def get_all_mainboard_codes():
     if result.returncode != 0:
         return []
     data = json.loads(result.stdout)
-    items = data.get('data', {}).get('item', [])
+    inner = data.get('data') if isinstance(data, dict) else data
+    if isinstance(inner, dict):
+        items = inner.get('item', [])
+    elif isinstance(inner, list):
+        items = inner
+    else:
+        items = []
     prefixes = ('600', '601', '603', '605', '000', '001', '002', '003',
                 '300', '301')  # 主板 + 创业板
     codes = [i['thscode'] for i in items
@@ -128,7 +135,7 @@ def main():
     if args.watch:
         print(f"=== 持仓ATR止损监控 ===")
         for code in args.watch.split(','):
-            df = get_stock_history(code.strip())
+            df = get_stock_history_with_today(code.strip(), end_date=datetime.datetime.now().strftime('%Y%m%d'))
             if df is None:
                 print(f"{code}: 数据获取失败")
                 continue
@@ -152,6 +159,15 @@ def main():
     print(f"共{len(codes)}只, 开始扫描(并发{args.workers})...\n")
 
     today = datetime.datetime.now().strftime('%Y%m%d')
+    latest = None
+    try:
+        import duckdb as _duckdb
+        _con = _duckdb.connect('~/.local/share/hithink-finance/market.duckdb')
+        latest = _con.execute("SELECT MAX(date) FROM v_daily").fetchone()[0]
+        _con.close()
+    except Exception:
+        latest = None
+
     hits = []
     total = len(codes)
     done = 0
@@ -159,16 +175,19 @@ def main():
 
     def worker(code):
         nonlocal done
-        df = get_stock_history(code, start_date='20230101', end_date=today)
+        # 盘口增强: 拼入今日实时 bar(mootdx主/腾讯备), 让信号判定落在今日而非昨日收盘
+        df = get_stock_history_with_today(code, start_date='20230101', end_date=today)
         if df is None:
             return None
-        # 排除停牌股: 最新5根K线内有0成交量或最新日期距今超过7天视为停牌/无数据
+        # 排除停牌股: 最新5根K线内有0成交量或最新日期不等于最新交易日视为停牌/无数据
         last_date = df.index[-1]
         if isinstance(last_date, tuple):
             return None
-        days_since = (datetime.datetime.now() - last_date.to_pydatetime()).days
-        if days_since > 7:
-            return None
+        if latest is not None:
+            last_date_val = last_date.to_pydatetime().date() if hasattr(last_date, 'to_pydatetime') else last_date
+            latest_date_val = latest.date() if hasattr(latest, 'date') and callable(getattr(latest, 'date')) else latest
+            if last_date_val != latest_date_val:
+                return None
         if (df['volume'].tail(5) == 0).any():
             return None
         sig, detail = check_signals(df)

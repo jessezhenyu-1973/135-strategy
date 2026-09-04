@@ -60,17 +60,129 @@ def get_stock_history(thscode, start_date='20230101', end_date='20260813'):
             data = json.load(f)
     except Exception:
         return None
-    items = data.get('data', {}).get('item', [])
+
+    # Handle both old dict format and new list format
+    inner = data.get('data') if isinstance(data, dict) else data
+    if isinstance(inner, dict):
+        # Old format or --output envelope
+        items = inner.get('item', [])
+        if not items and 'path' in inner:
+            try:
+                with open(inner['path']) as f2:
+                    inner2 = json.load(f2)
+                inner = inner2.get('data', []) if isinstance(inner2, dict) else inner2
+                items = inner if isinstance(inner, list) else inner.get('item', [])
+            except Exception:
+                items = []
+    elif isinstance(inner, list):
+        items = inner
+    else:
+        items = []
+
     if not items:
         return None
     df = pd.DataFrame(items)
-    df['date'] = pd.to_datetime(df['date_ms'], unit='ms')
+    if 'date_ms' in df.columns:
+        df['date'] = pd.to_datetime(df['date_ms'], unit='ms')
+    elif 'date' in df.columns:
+        df['date'] = pd.to_datetime(df['date'])
+    else:
+        return None
     df.set_index('date', inplace=True)
     df.sort_index(inplace=True)
-    df.rename(columns={'open_price': 'open', 'high_price': 'high',
-                       'low_price': 'low', 'close_price': 'close'}, inplace=True)
-    df = df[(df['close'] > 0) & (df['volume'] >= 0)]
+    col_map = {}
+    for old, new in [('open_price', 'open'), ('high_price', 'high'),
+                     ('low_price', 'low'), ('close_price', 'close')]:
+        if old in df.columns:
+            col_map[old] = new
+    if col_map:
+        df.rename(columns=col_map, inplace=True)
+    if 'close' not in df.columns:
+        return None
+    df = df[(df['close'] > 0) & (df.get('volume', 0) >= 0)]
     return df if len(df) >= 60 else None
+
+
+
+# ============================================================
+# 盘口实时补充: 把"今日未完成/已完成 K 线"拼到历史序列末尾
+# 解决 hithink-finance market history 滞后一整天的问题(14:30 选股却用昨天收盘)
+# 实时价源优先级: mootdx 通达信实时快照(主, 更准/含五档) -> 腾讯 qt.gtimg.cn(备)
+# ============================================================
+_TENCENT_PREFIX = {'SH': 'sh', 'SZ': 'sz'}
+
+
+def _thscode_to_tencent(thscode):
+    code, ex = thscode.split('.')
+    return _TENCENT_PREFIX.get(ex.upper(), 'sh') + code
+
+
+def _tencent_live_bar(thscode):
+    """返回今日腾讯实时行情的 1 行 DataFrame(open/high/low/close/volume, shares),
+    索引为今日 16:00; 若今日无实时行情(非交易时段/未开市)返回 None。"""
+    tx = _thscode_to_tencent(thscode)
+    url = f"https://qt.gtimg.cn/q={tx}"
+    try:
+        out = subprocess.run(['curl', '-s', '--max-time', '20', url],
+                             capture_output=True)
+        if out.returncode != 0 or not out.stdout.strip():
+            return None
+        raw = out.stdout.decode('gbk', 'ignore').strip()
+        payload = raw[raw.find('"') + 1: raw.rfind('"')]
+        f = payload.split('~')
+        if len(f) < 37:
+            return None
+        qtime = f[30]  # YYYYMMDDHHMMSS
+        today = datetime.datetime.now().strftime('%Y%m%d')
+        if not qtime.startswith(today):
+            return None  # 今日无实时行情, 回退历史序列
+        close = float(f[3])
+        openp = float(f[5])
+        high = float(f[33])
+        low = float(f[34])
+        vol_shares = float(f[36]) * 100  # 手 -> 股, 与 hithink 对齐
+        if vol_shares <= 0:
+            return None
+        idx = pd.Timestamp(datetime.datetime.now().replace(
+            hour=16, minute=0, second=0, microsecond=0))
+        return pd.DataFrame(
+            [{'open': openp, 'high': high, 'low': low,
+              'close': close, 'volume': vol_shares}],
+            index=[idx])
+    except Exception:
+        return None
+
+
+def get_stock_history_with_today(thscode, start_date='20230101', end_date=None):
+    """get_stock_history 的盘口增强版: 若今日有实时行情, 把今日 bar 拼到末尾再返回。
+    用于 14:30 实盘选股 / 持仓监控, 让信号判定落在今日实时数据而非昨日收盘。
+
+    实时价源优先级: mootdx 通达信实时快照(主, 更准/含五档) -> 腾讯快照(备, mootdx 取不到时兜底)。
+    两者返回结构一致(1 行 open/high/low/close/volume, 单位股, 索引今日16:00), 可直接互换。"""
+    if end_date is None:
+        end_date = datetime.datetime.now().strftime('%Y%m%d')
+    df = get_stock_history(thscode, start_date=start_date, end_date=end_date)
+    if df is None:
+        return None
+    # 主源: mootdx 通达信实时快照
+    live = None
+    try:
+        from mootdx_live import get_live_bar
+        live = get_live_bar(thscode)
+    except Exception:
+        live = None
+    # 备源: 腾讯快照(mootdx 未安装/取不到今日行情时兜底)
+    if live is None:
+        live = _tencent_live_bar(thscode)
+    if live is None:
+        return df  # 今日无实时行情, 保持原行为
+    last_date = df.index[-1].date()
+    if last_date >= live.index[0].date():
+        return df  # hithink 已含今日, 无需重复
+    combined = pd.concat([df, live])
+    combined = combined[~combined.index.duplicated(keep='last')]
+    combined.sort_index(inplace=True)
+    return combined
 
 
 def df_to_csv(df, path):

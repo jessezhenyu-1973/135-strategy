@@ -9,8 +9,16 @@
   - 日K骨架: hithink-finance 本地 DuckDB (--source local)
     默认路径: ~/.local/share/hithink-finance/market.duckdb
     (无需 API key; 若需最新数据先 `hithink-finance data sync`)
-  - 盘中实时校准: 腾讯 qt.gtimg.cn 实时快照 (--realtime)
+  - 盘中实时校准 (--realtime): 主源 mootdx 通达信批量快照(含昨收, 更准)
+    -> 备源 腾讯 qt.gtimg.cn 快照(mootdx 取不到时兜底)
     仅覆盖最后一根 bar 的 OHLCV, 让均线/ATR 基于当天盘中最新价重新计算
+    mootdx 昨收(last_close)用于按板块规则判涨停(主板10%/创业板科创板20%/ST主板5%)
+
+分池输出:
+  - 推荐(可买入): 剔除涨停+亏损后, 按量比降序取前 --top(默认10)
+  - 涨停: 不可买入(尾盘无法成交), 单独列出
+  - 业绩亏损: 最新季报归母净利润<=0, 暂不可买入, 单独列出
+    (hithink-finance financials income, 只对命中信号的股票调用, 不拖慢全市场扫描)
 
 硬过滤规则:
   1. 科创板: exchange=SH 且 thscode 以 688/689 开头  -> 排除
@@ -27,10 +35,10 @@ V18-ATR 信号 (与 config_v18_atr.yaml + stock_screener.py 一致):
   止损:   ATR(14) 吊灯止损 stop = 近N日最高价 - 2.5×ATR(14)
 
 用法:
-  python3 screener_v18_atr_full_a.py            # 扫描全A, 输出Top5
+  python3 screener_v18_atr_full_a.py            # 扫描全A, 输出Top10(按量比)
   python3 screener_v18_atr_full_a.py --top 8    # 输出Top8
   python3 screener_v18_atr_full_a.py --json-out /tmp/x.json
-  python3 screener_v18_atr_full_a.py --realtime # 盘中模式: 腾讯快照校准最后一根bar
+  python3 screener_v18_atr_full_a.py --realtime # 盘中模式: mootdx主/腾讯备 校准最后一根bar
 """
 import os
 import sys
@@ -151,12 +159,17 @@ def fetch_realtime_snapshot(thscodes):
                 thscode = mapping.get(qcode)
                 if not thscode:
                     continue
+                close = float(f[3]) if f[3] else 0.0
+                last_close = float(f[4]) if f[4] else 0.0
+                change_pct = ((close - last_close) / last_close * 100) if last_close > 0 else None
                 result[thscode] = {
                     "open": float(f[5]) if f[5] else 0.0,
                     "high": float(f[33]) if f[33] else 0.0,
                     "low": float(f[34]) if f[34] else 0.0,
-                    "close": float(f[3]) if f[3] else 0.0,
-                    "volume": float(f[6]) if f[6] else 0.0,
+                    "close": close,
+                    "volume": (float(f[6]) if f[6] else 0.0) * 100,  # 手 -> 股
+                    "last_close": last_close,
+                    "change_pct": change_pct,
                 }
             except Exception:
                 continue
@@ -199,6 +212,45 @@ def is_st(thscode, name):
     if name and ('ST' in name or '退' in name):
         return True
     return False
+
+
+def is_limit_up_by_code(code, change_pct, name=''):
+    """按板块规则判涨停(用实时涨跌幅, 比阈值略松以吸收四舍五入)。
+    主板(60/00) 10% -> 9.8; 创业板(30)/科创板(688) 20% -> 19.8; ST主板 5% -> 4.8。
+    change_pct 为 None(无昨收) 时返回 False。
+    """
+    if change_pct is None:
+        return False
+    if is_st(code, name):
+        return change_pct >= 4.8
+    if code.startswith(('300', '301', '688', '689')):
+        return change_pct >= 19.8
+    return change_pct >= 9.8
+
+
+def is_loss_stock(code):
+    """业绩亏损判断: 最新季报归母净利润是否为负 (hithink-finance financials income)。
+    取不到数据时保守保留(返回 False, 不误杀)。只对命中的少数几只调用, 不拖慢全市场扫描。
+    """
+    try:
+        import subprocess
+        result = subprocess.run(
+            ['hithink-finance', 'financials', 'income',
+             '--thscode', code, '--period', 'quarterly',
+             '--limit', '1', '--format', 'json'],
+            capture_output=True, text=True, timeout=15)
+        if result.returncode != 0:
+            return False
+        data = json.loads(result.stdout)
+        items = data.get('data', {}).get('item', [])
+        if not items:
+            return False
+        profit = items[0].get('parent_holder_net_profit')
+        if profit is None:
+            return False
+        return float(profit) <= 0
+    except Exception:
+        return False
 
 
 def load_history(con, thscode, bars=120):
@@ -398,7 +450,7 @@ def scan_one(args_tuple):
     # 实时快照覆盖最后一根 bar (盘中校准) - 仅更新 OHLC, 保留历史成交量用于量比计算
     rt_applied = False
     is_limit_up = False
-    limit_up_pct = None
+    change_pct = None
     if realtime and code in realtime:
         rt = realtime[code]
         if rt.get('close') is not None and rt.get('close') > 0:
@@ -409,12 +461,8 @@ def scan_one(args_tuple):
                 if v is not None and isinstance(v, (int, float)):
                     df.loc[idx, k] = v
             rt_applied = True
-            # 涨停判断: 用实时涨跌幅判断, ST 股 4.5%/普通股 9.5% 以上视为涨停
             change_pct = rt.get('change_pct')
-            if change_pct is not None:
-                is_stock = is_st(code, name)
-                limit_up_pct = 4.5 if is_stock else 9.5
-                is_limit_up = change_pct >= limit_up_pct
+            is_limit_up = is_limit_up_by_code(code, change_pct, name)
     sig, detail = check_signals(df)
     if not sig:
         return None
@@ -440,12 +488,15 @@ def scan_one(args_tuple):
         'is_small_cap': is_small,
         'main_fund': main_fund,
         'realtime': rt_applied,
+        'limit_up': is_limit_up,
+        'change_pct': round(change_pct, 2) if change_pct is not None else None,
+        'loss': is_loss_stock(code),
     }
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--top', type=int, default=5)
+    ap.add_argument('--top', type=int, default=10)
     ap.add_argument('--json-out', type=str, default=None)
     ap.add_argument('--db', type=str, default=DB_PATH)
     ap.add_argument('--concurrency', type=int, default=CONCURRENCY)
@@ -476,13 +527,25 @@ def main():
     new_stock_cutoff = latest - datetime.timedelta(days=args.new_stock_days)
 
     # ---- 实时快照校准 (仅最后一根bar) ----
+    # 主源: mootdx 通达信批量快照(含昨收, 更准); 备源: 腾讯 HTTP 快照(mootdx 取不到时兜底)
     realtime_map = {}
+    realtime_src = 'none'
     if args.realtime:
-        print("[实时] 正在拉取腾讯实时快照...")
         all_codes = [c for c, _ in universe]
         t0 = time.time()
-        realtime_map = fetch_realtime_snapshot(all_codes)
-        print(f"[实时] 腾讯快照返回 {len(realtime_map)} 只, 耗时{time.time()-t0:.1f}s")
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from mootdx_live import get_live_snapshot
+            realtime_map = get_live_snapshot(all_codes)
+            if realtime_map:
+                realtime_src = 'mootdx'
+        except Exception as e:
+            print(f"  [warn] mootdx 批量快照失败: {e}")
+        if not realtime_map:
+            print("[实时] mootdx 无数据, 回退腾讯快照...")
+            realtime_map = fetch_realtime_snapshot(all_codes)
+            realtime_src = 'tencent' if realtime_map else 'none'
+        print(f"[实时] 源={realtime_src} 返回 {len(realtime_map)} 只, 耗时{time.time()-t0:.1f}s")
 
     # ---- 市值多源冗余: 主源=腾讯(fetch_market_cap已落盘 MARKET_CAP) -> 回退东财批量 ----
     all_codes = [c for c, _ in universe]
@@ -524,60 +587,67 @@ def main():
             if done % 1000 == 0 or done == len(tasks):
                 print(f"  ...已扫描 {done}/{len(tasks)}, 命中 {len(hits)}")
 
-    # 排序: 小盘加权优先 -> 主力资金连续加权(正加负减, 封顶±20亿) -> 信号强度 -> 量比
-        def _fund_w(h):
-            mf = h.get('main_fund')
-            if mf is None:
-                return 0.0
-            return -min(max(mf, -20.0), 20.0)
+    # ---- 分池: 涨停(不可买) / 亏损(暂不可买) / 可买入 ----
+    limit_up_list = [h for h in hits if h.get('limit_up')]
+    loss_list = [h for h in hits if (not h.get('limit_up')) and h.get('loss')]
+    tradable = [h for h in hits if (not h.get('limit_up')) and (not h.get('loss'))]
 
-        hits.sort(key=lambda x: (not x['is_small_cap'], _fund_w(x),
-                                 -x['score'], -x['vol_ratio']))
-        top = hits[:args.top]
+    # 推荐池: 可买入股按量比降序(主), 次信号强度, 次小盘优先, 取前 args.top(默认10)
+    tradable.sort(key=lambda x: (-x['vol_ratio'], -x['score'], not x['is_small_cap']))
+    top = tradable[:args.top]
 
-        buyable = [h for h in hits if not h.get('limit_up')]
-        limit_up_list = [h for h in hits if h.get('limit_up')]
-        buyable_top = buyable[:args.top]
+    print(f"\n{'='*64}")
+    small_cnt = sum(1 for h in hits if h['is_small_cap'])
+    rt_cnt = sum(1 for h in hits if h.get('realtime'))
+    mf_pos = sum(1 for h in hits if (h.get('main_fund') or 0) > 0)
+    mf_neg = sum(1 for h in hits if (h.get('main_fund') or 0) < 0)
+    print(f"触发 V18-ATR 信号: 共 {len(hits)} 只 (小盘<{args.small_cap_thr}亿 {small_cnt} 只, "
+          f"主力净流入+ {mf_pos} / - {mf_neg} 只, 实时校准 {rt_cnt} 只)")
+    print(f"涨停 {len(limit_up_list)} | 亏损 {len(loss_list)} | 可买入 {len(tradable)} | 推荐 Top{args.top}(按量比):\n")
 
-        print(f"\n{'='*64}")
-        small_cnt = sum(1 for h in hits if h['is_small_cap'])
-        rt_cnt = sum(1 for h in hits if h.get('realtime'))
-        mf_pos = sum(1 for h in hits if (h.get('main_fund') or 0) > 0)
-        mf_neg = sum(1 for h in hits if (h.get('main_fund') or 0) < 0)
-        print(f"触发 V18-ATR 信号: 共 {len(hits)} 只 (小盘<{args.small_cap_thr}亿 {small_cnt} 只, "
-              f"主力净流入+ {mf_pos} / - {mf_neg} 只, 实时校准 {rt_cnt} 只)")
-        print(f"涨停不可买入 {len(limit_up_list)} 只 | 可买入 {len(buyable)} 只 | 推荐 Top{args.top}:\n")
+    def _capstr(h):
+        return f"总市值{h['total_cap']}亿" if h['total_cap'] is not None else "总市值N/A"
 
-        print("【涨停 / 不可买入】")
+    def _tags(h):
+        tag = " [小盘]" if h['is_small_cap'] else ""
+        mf = h.get('main_fund')
+        if mf is not None:
+            tag += f" [主力{'+' if mf >= 0 else ''}{mf:.1f}亿]"
+        if h.get('realtime'):
+            tag += " [实时]"
+        return tag
+
+    print("【推荐 / 可买入】(按量比降序)")
+    for i, h in enumerate(top, 1):
+        print(f"{i}. {h['code']} {h['name']}{_tags(h)} | {h['signal']} | "
+              f"收盘{h['close']} 量比{h['vol_ratio']}x | {_capstr(h)} | "
+              f"ATR止损{h['atr_stop']} ({h['stop_pct']}%)")
+
+    if limit_up_list:
+        print(f"\n【涨停 / 不可买入】({len(limit_up_list)} 只)")
         for i, h in enumerate(limit_up_list[:args.top], 1):
-            capstr = f"总市值{h['total_cap']}亿" if h['total_cap'] is not None else "总市值N/A"
             print(f"{i}. {h['code']} {h['name']} | {h['signal']} | "
-                  f"收盘{h['close']} 量比{h['vol_ratio']}x | {capstr} | "
-                  f"ATR止损{h['atr_stop']} ({h['stop_pct']}%) | 涨停")
+                  f"收盘{h['close']} 量比{h['vol_ratio']}x | {_capstr(h)} | 涨停")
 
-        print("\n【未涨停 / 可买入】")
-        for i, h in enumerate(buyable_top, 1):
-            tag = " [小盘]" if h['is_small_cap'] else ""
-            mf = h.get('main_fund')
-            if mf is not None:
-                tag += f" [主力{'+' if mf >= 0 else ''}{mf:.1f}亿]"
-            if h.get('realtime'):
-                tag += " [实时]"
-            capstr = f"总市值{h['total_cap']}亿" if h['total_cap'] is not None else "总市值N/A"
-            print(f"{i}. {h['code']} {h['name']}{tag} | {h['signal']} | "
-                  f"收盘{h['close']} 量比{h['vol_ratio']}x | {capstr} | "
-                  f"ATR止损{h['atr_stop']} ({h['stop_pct']}%)")
-        out = args.json_out or os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), 'screener_full_a_today.json')
-        with open(out, 'w') as f:
-            json.dump({'date': str(latest), 'scanned': len(tasks),
-                       'total_hits': len(hits), 'small_cap_hits': small_cnt,
-                       'main_fund_pos': mf_pos, 'main_fund_neg': mf_neg,
-                       'realtime_hits': rt_cnt, 'limit_up_count': len(limit_up_list),
-                       'buyable_count': len(buyable), 'top': buyable_top,
-                       'limit_up': limit_up_list}, f,
-                     ensure_ascii=False, indent=2)
-        print(f"\n结果已保存: {out}")
+    if loss_list:
+        print(f"\n【业绩亏损 / 暂不可买入】({len(loss_list)} 只)")
+        for i, h in enumerate(loss_list[:args.top], 1):
+            print(f"{i}. {h['code']} {h['name']} | {h['signal']} | "
+                  f"收盘{h['close']} 量比{h['vol_ratio']}x | {_capstr(h)} | 亏损")
+
+    out = args.json_out or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), 'screener_full_a_today.json')
+    with open(out, 'w') as f:
+        json.dump({'date': str(latest), 'scanned': len(tasks),
+                   'total_hits': len(hits), 'small_cap_hits': small_cnt,
+                   'main_fund_pos': mf_pos, 'main_fund_neg': mf_neg,
+                   'realtime_hits': rt_cnt, 'realtime_src': realtime_src,
+                   'limit_up_count': len(limit_up_list),
+                   'loss_count': len(loss_list),
+                   'tradable_count': len(tradable), 'top': top,
+                   'limit_up': limit_up_list, 'loss': loss_list}, f,
+                 ensure_ascii=False, indent=2)
+    print(f"\n结果已保存: {out}")
 
 
 if __name__ == '__main__':
