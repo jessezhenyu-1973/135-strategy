@@ -101,10 +101,18 @@ def m2_check(df, lp):
     last_close = float(close.iloc[i])
     atrv = float(atr.iloc[i]) if atr.iloc[i] == atr.iloc[i] else 0.0
     stop = last_close - lp.ATR_MULT * atrv
+    # 第二定律 当日努力/结果 (滞涨离场的原始量, 供报告展示双离场口径)
+    vma = vol.rolling(lp.VMA_PERIOD, min_periods=10).mean()
+    eff = float(vol.iloc[i] / vma.iloc[i]) if vma.iloc[i] else 0.0
+    res_pct = float((close.iloc[i] / close.iloc[i - 1] - 1) * 100) if i >= 1 else 0.0
+    stall_today = bool(vs['upstall'].iloc[i])
     return {'demand_ratio': round(float(vs['demand_ratio'].iloc[i]), 3),
             'close': round(last_close, 2),
             'atr_stop': round(stop, 2),
-            'stop_pct': round((stop - last_close) / last_close * 100, 1) if last_close else None}
+            'stop_pct': round((stop - last_close) / last_close * 100, 1) if last_close else None,
+            'effort': round(eff, 2),
+            'res_pct': round(res_pct, 2),
+            'stall_today': stall_today}
 
 
 def main():
@@ -181,10 +189,15 @@ def main():
     print(f"\n{'='*64}")
     print(f"M2威科夫(净需求入场+滞涨离场, 不用Spring) | HS300试点 | 扫描 {len(codes)} 只")
     print(f"触发入场信号: {len(hits)} 只 (多头regime AND 第三定律净需求 AND 近3日无滞涨)")
-    print(f"\n【M2 HS300 试点推荐】(按需求强度降序) 单笔建议≤5%仓 · ATR吊灯{lp.ATR_MULT}x止损锁利润 · 不主动止盈\n")
+    print(f"\n【M2 HS300 试点推荐】(按需求强度降序) 单笔建议≤5%仓 · 不主动止盈\n")
+    print(f"双离场(与回测M2口径一致, 谁先触发先卖):")
+    print(f"  ① ATR吊灯: 收盘跌破 止损价(=最新收盘-{lp.ATR_MULT}xATR14) → 卖出\n"
+          f"  ② 上方滞涨: 当日 量>{lp.EFFORT_VOL}xVMA20 且 涨幅<{lp.RESULT_EPS*100}% (放量推不动) → 当日收卖出")
     for i, h in enumerate(top, 1):
+        st = f" | ⚠当日已现滞涨(量{h['effort']}x/涨幅{h['res_pct']}%)" if h.get('stall_today') else \
+             f" | 努力{h['effort']}x 涨幅{h['res_pct']}%(<{lp.EFFORT_VOL}x或涨幅≥{lp.RESULT_EPS*100}%则安全)"
         print(f"{i}. {h['code']} {h['name']} | 需求比{h['demand_ratio']} | "
-              f"收盘{h['close']} | ATR止损{h['atr_stop']} ({h['stop_pct']}%)")
+              f"收盘{h['close']} | ATR吊灯止损{h['atr_stop']} ({h['stop_pct']}%){st}")
     if not top:
         print('(今日无 M2 入场信号 → 按杰西"没有交易机会就空仓"原则, 当日 M2 不新增)')
 
