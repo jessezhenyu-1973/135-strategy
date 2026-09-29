@@ -186,8 +186,9 @@ ATR_PERIOD = 14
 ATR_MULT = 2.5
 
 
-def get_universe(con):
-    """返回候选股票池 (已排除科创板/北交所) 及全市场最新交易日"""
+def get_universe(con, main_board_only=False):
+    """返回候选股票池 (已排除科创板/北交所) 及全市场最新交易日.
+    main_board_only=True: 额外剔除创业板(3xx), 仅保留沪深主板 — 落实V18创业板-11.2%禁用结论"""
     latest = con.execute("SELECT MAX(date) FROM v_daily").fetchone()[0]
     rows = con.execute("""
         SELECT thscode, exchange, name
@@ -201,6 +202,9 @@ def get_universe(con):
             continue
         # 排除科创板 (688/689 开头, 仅沪市)
         if exch == 'SH' and (thscode.startswith('688') or thscode.startswith('689')):
+            continue
+        # 聚焦沪深主板: 剔除创业板 (3xx 全段)
+        if main_board_only and thscode.startswith('3'):
             continue
         uni.append((thscode, name))
     return uni, latest
@@ -231,11 +235,16 @@ def is_limit_up_by_code(code, change_pct, name=''):
 def is_loss_stock(code):
     """业绩亏损判断: 最新季报归母净利润是否为负 (hithink-finance financials income)。
     取不到数据时保守保留(返回 False, 不误杀)。只对命中的少数几只调用, 不拖慢全市场扫描。
+    hithink 用绝对路径(npm-global), cron 环境 PATH 不一定含它。
     """
     try:
         import subprocess
+        import shutil
+        hithink = '/home/jesse/.npm-global/bin/hithink-finance'
+        if not os.path.exists(hithink):
+            hithink = shutil.which('hithink-finance') or 'hithink-finance'
         result = subprocess.run(
-            ['hithink-finance', 'financials', 'income',
+            [hithink, 'financials', 'income',
              '--thscode', code, '--period', 'quarterly',
              '--limit', '1', '--format', 'json'],
             capture_output=True, text=True, timeout=15)
@@ -506,10 +515,12 @@ def main():
                     help='东财主力净流入榜TopN作为排序加分(0=关闭)')
     ap.add_argument('--realtime', action='store_true', default=False,
                     help='盘中模式: 用腾讯实时快照校准最后一根bar的OHLCV')
+    ap.add_argument('--main-board', action='store_true', default=False,
+                    help='仅沪深主板(剔除创业板3xx), 落实V18创业板-11.2%禁用; 默认全池')
     args = ap.parse_args()
 
     con = duckdb.connect(args.db, read_only=True)
-    universe, latest = get_universe(con)
+    universe, latest = get_universe(con, main_board_only=args.main_board)
     # 多源冗余上市日: 优先 tushare/akshare(7天缓存) -> 失败回退本地 DuckDB MIN(date)
     listing_map, listing_src = load_listing_dates_smart(con, latest)
     # 一次性把全市场近220天日K读进内存(单连接, ~0.5s), 之后扫描零 DuckDB IO
